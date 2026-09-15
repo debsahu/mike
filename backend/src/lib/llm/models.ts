@@ -51,7 +51,7 @@ export const GEMINI_LOW_MODELS = [
 ] as const;
 export const OPENAI_LOW_MODELS = ["gpt-5.6-luna", "gpt-5.4-mini"] as const;
 
-// Local Claude Code (Claude subscription) — see lib/llm/claudeCode.ts. The
+// Local Claude Code (Claude subscription), see lib/llm/claudeCode.ts. The
 // part after the prefix is the Claude Code model alias. Offered only when the
 // backend sets CLAUDE_CODE_ENABLED.
 export const CLAUDE_CODE_MAIN_MODELS = [

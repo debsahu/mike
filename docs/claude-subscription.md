@@ -113,7 +113,7 @@ missing or was not loaded, so recreate the backend container after you edit
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CLAUDE_CODE_ENABLED` | `false` | Offers the `claude-code/*` models and allows them to run |
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | Subscription token from `claude setup-token` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | none | Subscription token from `claude setup-token` |
 | `CLAUDE_CODE_PATH` | bundled binary | Path to a different `claude` executable |
 
 ## Limits and troubleshooting

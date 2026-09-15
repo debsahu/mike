@@ -34,7 +34,7 @@ export const MODELS: ModelOption[] = [
   { id: "gpt-5.5", label: "GPT-5.5", group: "OpenAI" },
   { id: "gpt-5.4", label: "GPT-5.4", group: "OpenAI" },
   // Local (Ollama) and Claude Code subscription models are appended
-  // dynamically — see useOllamaModels and useClaudeCodeModels.
+  // dynamically; see useOllamaModels and useClaudeCodeModels.
 ];
 
 export const SETTINGS_MODELS: ModelOption[] = [

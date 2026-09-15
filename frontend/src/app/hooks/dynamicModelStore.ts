@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 // Module-level store so every picker shares one fetch and a refresh propagates
 // to all of them. Resolves to an empty list when the source is unreachable or
-// disabled — the app works without runtime-discovered models.
+// disabled; the app works without runtime-discovered models.
 export function createDynamicModelStore<T>(fetchModels: () => Promise<T[]>): {
     refresh: () => Promise<T[]>;
     useModels: () => T[];
@@ -25,7 +25,7 @@ export function createDynamicModelStore<T>(fetchModels: () => Promise<T[]>): {
                     return m;
                 })
                 .catch(() => {
-                    inflight = null; // don't poison cache — retry on next load
+                    inflight = null; // don't poison cache; retry on next load
                     return [];
                 });
         }

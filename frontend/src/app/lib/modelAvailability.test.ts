@@ -137,7 +137,7 @@ describe("isProviderAvailable", () => {
         ).toBe(true);
     });
 
-    it("treats claude-code as always available — subscription needs no API key", () => {
+    it("treats claude-code as always available because a subscription needs no API key", () => {
         expect(isProviderAvailable("claude-code", keys({}))).toBe(true);
         expect(
             isProviderAvailable("claude-code", {} as unknown as ApiKeyState),
