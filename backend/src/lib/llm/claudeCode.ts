@@ -8,6 +8,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { claudeCodeIdleTimeoutMs } from "../runtimeConfig";
 import { ToolExecutionBatcher } from "./aiSdk";
 import { claudeCodeModelAlias, isClaudeCodeEnabled } from "./models";
 import type {
@@ -228,6 +229,55 @@ function resultError(message: SdkMessage): Error | null {
   return new Error(`Claude Code request failed: ${detail}`);
 }
 
+/**
+ * Aborts a turn that has gone quiet. Every SDK message restarts the
+ * countdown, so only genuine silence from the subprocess trips it. Mike's own
+ * tool runs are paused out: while a tool is in flight Claude Code is waiting
+ * on us, which is not a stall on its side.
+ */
+class IdleWatchdog {
+  private timer: NodeJS.Timeout | undefined;
+  private inFlight = 0;
+  private stopped = false;
+
+  constructor(
+    private readonly ms: number,
+    private readonly onIdle: () => void,
+  ) {}
+
+  touch(): void {
+    this.clear();
+    if (this.stopped || !this.ms || this.inFlight) return;
+    this.timer = setTimeout(this.onIdle, this.ms).unref();
+  }
+
+  pause(): void {
+    this.inFlight += 1;
+    this.clear();
+  }
+
+  resume(): void {
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    if (!this.inFlight) this.touch();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.clear();
+  }
+
+  private clear(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+}
+
+function idleError(ms: number): Error {
+  return new Error(
+    `Claude Code stopped responding after ${Math.round(ms / 1000)}s without output.`,
+  );
+}
+
 function linkAbort(signal: AbortSignal | undefined): AbortController {
   const controller = new AbortController();
   if (signal?.aborted) controller.abort(signal.reason);
@@ -256,6 +306,13 @@ export async function streamClaudeCode(
   const tools = params.runTools ? (params.tools ?? []) : [];
   const ids = new ToolUseIdQueue();
 
+  const idleMs = claudeCodeIdleTimeoutMs();
+  let idleTimedOut = false;
+  const watchdog = new IdleWatchdog(idleMs, () => {
+    idleTimedOut = true;
+    abortController.abort();
+  });
+
   // A runTools failure (ask_inputs pause, abort, dispatcher error) ends the
   // whole query and is rethrown unchanged to the chat loop.
   let toolFailure: unknown;
@@ -263,12 +320,15 @@ export async function streamClaudeCode(
     ? new ToolExecutionBatcher(params.runTools)
     : null;
   const execute = async (call: NormalizedToolCall) => {
+    watchdog.pause();
     try {
       return await batcher!.execute(call);
     } catch (error) {
       toolFailure ??= error;
       abortController.abort(error);
       throw error;
+    } finally {
+      watchdog.resume();
     }
   };
 
@@ -305,8 +365,10 @@ export async function streamClaudeCode(
     params.callbacks?.onReasoningBlockEnd?.();
   };
 
+  watchdog.touch();
   try {
     for await (const message of q) {
+      watchdog.touch();
       if ("parent_tool_use_id" in message && message.parent_tool_use_id) {
         continue;
       }
@@ -347,14 +409,17 @@ export async function streamClaudeCode(
   } catch (error) {
     if (toolFailure !== undefined) throw toolFailure;
     if (params.abortSignal?.aborted) throw abortError(params.abortSignal);
+    if (idleTimedOut) throw idleError(idleMs);
     throw error;
   } finally {
+    watchdog.stop();
     closeThinking();
     q.close();
   }
 
   if (toolFailure !== undefined) throw toolFailure;
   if (params.abortSignal?.aborted) throw abortError(params.abortSignal);
+  if (idleTimedOut) throw idleError(idleMs);
   return { fullText };
 }
 
@@ -364,23 +429,40 @@ export async function completeClaudeCode(
 ): Promise<string> {
   assertEnabled();
   const { query } = sdk ?? (await loadSdk());
+  // Title generation is awaited before the chat stream closes, so it gets the
+  // same silence guard as a streamed turn. It runs no tools, so no pausing.
+  const idleMs = claudeCodeIdleTimeoutMs();
+  let idleTimedOut = false;
+  const abortController = new AbortController();
+  const watchdog = new IdleWatchdog(idleMs, () => {
+    idleTimedOut = true;
+    abortController.abort();
+  });
   const q = query({
     prompt: params.user,
     options: {
       ...baseOptions(params.model, params.systemPrompt),
+      abortController,
       thinking: { type: "disabled" },
       maxTurns: 1,
     },
   });
+  watchdog.touch();
   try {
     for await (const message of q) {
+      watchdog.touch();
       if (message.type !== "result") continue;
       const error = resultError(message);
       if (error) throw error;
       return message.subtype === "success" ? message.result : "";
     }
+  } catch (error) {
+    if (idleTimedOut) throw idleError(idleMs);
+    throw error;
   } finally {
+    watchdog.stop();
     q.close();
   }
+  if (idleTimedOut) throw idleError(idleMs);
   throw new Error("Claude Code returned no result.");
 }

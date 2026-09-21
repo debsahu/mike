@@ -294,6 +294,111 @@ describe("streamClaudeCode", () => {
         ).rejects.toMatchObject({ name: "AbortError" });
     });
 
+    describe("idle guard", () => {
+        // Only the watchdog's own timers are faked; ToolExecutionBatcher
+        // flushes on a microtask and must keep running for real.
+        beforeEach(() => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+            vi.stubEnv("CLAUDE_CODE_IDLE_TIMEOUT_MS", "10000");
+        });
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+
+        it("aborts a turn that produces no output", async () => {
+            const { sdk } = fakeSdk(async function* ({ options }) {
+                yield textDelta("Working");
+                await new Promise<void>((resolve) => {
+                    options.abortController.signal.addEventListener(
+                        "abort",
+                        () => resolve(),
+                        { once: true },
+                    );
+                    vi.advanceTimersByTime(10_000);
+                });
+                throw new Error("Claude Code process aborted");
+            });
+
+            await expect(
+                streamClaudeCode(
+                    {
+                        model: "claude-code/sonnet",
+                        systemPrompt: "",
+                        messages: [{ role: "user", content: "Hi" }],
+                    },
+                    sdk,
+                ),
+            ).rejects.toThrow(/stopped responding after 10s/);
+        });
+
+        it("does not treat a slow tool run as a stall", async () => {
+            let releaseTool = () => {};
+            const toolStarted = new Promise<void>((resolve) => {
+                releaseTool = resolve;
+            });
+            const runTools = vi.fn(async (calls: any[]) => {
+                // Outlast the idle window while the watchdog is paused.
+                vi.advanceTimersByTime(60_000);
+                releaseTool();
+                return calls.map((c) => ({
+                    tool_use_id: c.id,
+                    content: "Delaware law",
+                }));
+            });
+
+            const { sdk } = fakeSdk(async function* (ctx) {
+                yield {
+                    type: "assistant",
+                    parent_tool_use_id: null,
+                    message: {
+                        content: [
+                            {
+                                type: "tool_use",
+                                id: "toolu_1",
+                                name: "mcp__mike__read_document",
+                                input: {},
+                            },
+                        ],
+                    },
+                };
+                await ctx.callTool("read_document", {});
+                await toolStarted;
+                yield textDelta("Delaware law.");
+                yield success("Delaware law.");
+            });
+
+            const result = await streamClaudeCode(
+                {
+                    model: "claude-code/sonnet",
+                    systemPrompt: "",
+                    messages: [{ role: "user", content: "Hi" }],
+                    tools: [tool],
+                    runTools,
+                },
+                sdk,
+            );
+            expect(result.fullText).toBe("Delaware law.");
+        });
+
+        it("is disabled by CLAUDE_CODE_IDLE_TIMEOUT_MS=0", async () => {
+            vi.stubEnv("CLAUDE_CODE_IDLE_TIMEOUT_MS", "0");
+            const { sdk } = fakeSdk(async function* () {
+                yield textDelta("Slow");
+                vi.advanceTimersByTime(60 * 60_000);
+                yield success("Slow");
+            });
+            const result = await streamClaudeCode(
+                {
+                    model: "claude-code/sonnet",
+                    systemPrompt: "",
+                    messages: [{ role: "user", content: "Hi" }],
+                },
+                sdk,
+            );
+            expect(result.fullText).toBe("Slow");
+        });
+    });
+
     it("refuses to run when disabled", async () => {
         vi.stubEnv("CLAUDE_CODE_ENABLED", "false");
         const { sdk } = fakeSdk(async function* () {});

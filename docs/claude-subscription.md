@@ -115,6 +115,7 @@ missing or was not loaded, so recreate the backend container after you edit
 | `CLAUDE_CODE_ENABLED` | `false` | Offers the `claude-code/*` models and allows them to run |
 | `CLAUDE_CODE_OAUTH_TOKEN` | none | Subscription token from `claude setup-token` |
 | `CLAUDE_CODE_PATH` | bundled binary | Path to a different `claude` executable |
+| `CLAUDE_CODE_IDLE_TIMEOUT_MS` | `120000` | Aborts a turn that produces no output for this long. Clamped to 10000-1800000; `0` disables |
 
 ## Limits and troubleshooting
 
@@ -123,6 +124,12 @@ missing or was not loaded, so recreate the backend container after you edit
   If you reach a limit, the chat shows the error Claude Code returns.
 - **Latency:** each request starts a new process, which adds about 1 second
   before the first token.
+- **Stalled turns:** the provider runs a local process, so there is no socket
+  timeout behind it. A turn that goes quiet for `CLAUDE_CODE_IDLE_TIMEOUT_MS`
+  is aborted and the chat shows an error. The timer measures silence rather
+  than total time, and it stops while one of Mike's tools is running, so long
+  turns that keep working are not cut short. Raise it if you see spurious
+  timeouts on very slow hardware.
 - **Models missing from the picker:** confirm `CLAUDE_CODE_ENABLED=true` is
   set, recreate the backend, and reload the page.
 - **Expired or revoked token:** run `claude setup-token` again and update
