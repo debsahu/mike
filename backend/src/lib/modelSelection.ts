@@ -30,6 +30,14 @@ export const MODEL_REQUIRED_DETAIL =
 export const TABULAR_MODEL_REQUIRED_DETAIL =
     "Select a model for this tabular review before running it.";
 
+/**
+ * Claude Code authenticates with the operator's subscription, so when it is
+ * switched off the remedy is a server setting rather than a key the user could
+ * add. Its failures must stay clear of the "add your API key" prompts.
+ */
+export const CLAUDE_CODE_DISABLED_DETAIL =
+    "Claude Code models are disabled on this server. Select another model.";
+
 export const DEFAULT_REASONING_LEVEL: ReasoningLevel = "high";
 
 export function normalizeReasoningLevel(
@@ -143,6 +151,14 @@ export async function resolveEffectiveChatModel(args: {
                 "throw",
             );
             if (!hasApiKeyForModel(model, args.apiKeys)) {
+                if (providerForModel(model) === "claude-code") {
+                    return {
+                        ok: false,
+                        status: 400,
+                        code: "model_unavailable",
+                        detail: CLAUDE_CODE_DISABLED_DETAIL,
+                    };
+                }
                 return {
                     ok: false,
                     status: 422,
