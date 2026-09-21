@@ -488,6 +488,12 @@ export async function completeClaudeCode(
     for await (const message of q) {
       watchdog.touch();
       if (message.type !== "result") continue;
+      // A result can be queued as a timer fires. Returning it here would skip
+      // the checks after the loop, so a turn we abandoned would look like it
+      // succeeded; checking before resultError also keeps the message about
+      // the bound rather than the abort it caused.
+      if (deadlineExpired) throw deadlineError(timeoutMs);
+      if (idleTimedOut) throw idleError(idleMs);
       const error = resultError(message);
       if (error) throw error;
       return message.subtype === "success" ? message.result : "";

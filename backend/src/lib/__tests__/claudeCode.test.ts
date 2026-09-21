@@ -486,6 +486,36 @@ describe("streamClaudeCode", () => {
 });
 
 describe("completeClaudeCode", () => {
+    // A result can already be queued when a timer fires. The in-loop return
+    // reaches `finally` and skips the checks after the loop, so without an
+    // explicit check an abandoned turn would be reported as a success.
+    it.each([
+        ["CLAUDE_CODE_TIMEOUT_MS", /did not finish within 1 minutes/],
+        ["CLAUDE_CODE_IDLE_TIMEOUT_MS", /stopped responding after 10s/],
+    ])("does not return a result that raced %s", async (envVar, expected) => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        vi.stubEnv("CLAUDE_CODE_IDLE_TIMEOUT_MS", "0");
+        vi.stubEnv("CLAUDE_CODE_TIMEOUT_MS", "0");
+        vi.stubEnv(envVar, envVar.includes("IDLE") ? "10000" : "60000");
+        try {
+            const { sdk } = fakeSdk(async function* () {
+                // The timer fires, then the already-queued result arrives.
+                vi.advanceTimersByTime(60_000);
+                yield success("Lease Review");
+            });
+            await expect(
+                completeClaudeCode(
+                    { model: "claude-code/haiku", user: "x" },
+                    sdk,
+                ),
+            ).rejects.toThrow(expected);
+        } finally {
+            vi.useRealTimers();
+            vi.unstubAllEnvs();
+            vi.stubEnv("CLAUDE_CODE_ENABLED", "true");
+        }
+    });
+
     it("returns the result text without tools or thinking", async () => {
         const { sdk, captured } = fakeSdk(async function* () {
             yield success("Lease Review");
