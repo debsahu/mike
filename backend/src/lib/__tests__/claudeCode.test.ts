@@ -71,6 +71,14 @@ const success = (result = "") => ({
     result,
 });
 
+/** Resolves once the signal aborts, including if it already has. */
+function aborted(signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+    );
+}
+
 const tool = {
     type: "function" as const,
     function: {
@@ -380,8 +388,74 @@ describe("streamClaudeCode", () => {
             expect(result.fullText).toBe("Delaware law.");
         });
 
+        // The case silence cannot catch: the turn keeps producing output,
+        // so the idle timer is reset forever, but it never converges.
+        it("ends a turn that keeps emitting but never finishes", async () => {
+            vi.stubEnv("CLAUDE_CODE_IDLE_TIMEOUT_MS", "0");
+            vi.stubEnv("CLAUDE_CODE_TIMEOUT_MS", "60000");
+            const { sdk } = fakeSdk(async function* ({ options }) {
+                // Output never stops, so only the deadline can end this.
+                for (let i = 0; i < 12; i += 1) {
+                    yield textDelta("thinking ");
+                    vi.advanceTimersByTime(5_000);
+                }
+                await aborted(options.abortController.signal);
+                throw new Error("Claude Code process aborted");
+            });
+
+            await expect(
+                streamClaudeCode(
+                    {
+                        model: "claude-code/sonnet",
+                        systemPrompt: "",
+                        messages: [{ role: "user", content: "Hi" }],
+                    },
+                    sdk,
+                ),
+            ).rejects.toThrow(/did not finish within 1 minutes/);
+        });
+
+        it("does not cut short a turn that finishes inside the budget", async () => {
+            vi.stubEnv("CLAUDE_CODE_IDLE_TIMEOUT_MS", "0");
+            vi.stubEnv("CLAUDE_CODE_TIMEOUT_MS", "60000");
+            const { sdk } = fakeSdk(async function* () {
+                yield textDelta("Done.");
+                vi.advanceTimersByTime(59_000);
+                yield success("Done.");
+            });
+            const result = await streamClaudeCode(
+                {
+                    model: "claude-code/sonnet",
+                    systemPrompt: "",
+                    messages: [{ role: "user", content: "Hi" }],
+                },
+                sdk,
+            );
+            expect(result.fullText).toBe("Done.");
+        });
+
+        it("is disabled by CLAUDE_CODE_TIMEOUT_MS=0", async () => {
+            vi.stubEnv("CLAUDE_CODE_IDLE_TIMEOUT_MS", "0");
+            vi.stubEnv("CLAUDE_CODE_TIMEOUT_MS", "0");
+            const { sdk } = fakeSdk(async function* () {
+                yield textDelta("Slow");
+                vi.advanceTimersByTime(6 * 60 * 60_000);
+                yield success("Slow");
+            });
+            const result = await streamClaudeCode(
+                {
+                    model: "claude-code/sonnet",
+                    systemPrompt: "",
+                    messages: [{ role: "user", content: "Hi" }],
+                },
+                sdk,
+            );
+            expect(result.fullText).toBe("Slow");
+        });
+
         it("is disabled by CLAUDE_CODE_IDLE_TIMEOUT_MS=0", async () => {
             vi.stubEnv("CLAUDE_CODE_IDLE_TIMEOUT_MS", "0");
+            vi.stubEnv("CLAUDE_CODE_TIMEOUT_MS", "0");
             const { sdk } = fakeSdk(async function* () {
                 yield textDelta("Slow");
                 vi.advanceTimersByTime(60 * 60_000);

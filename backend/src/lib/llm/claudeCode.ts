@@ -8,7 +8,10 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { claudeCodeIdleTimeoutMs } from "../runtimeConfig";
+import {
+  claudeCodeIdleTimeoutMs,
+  claudeCodeTimeoutMs,
+} from "../runtimeConfig";
 import { ToolExecutionBatcher } from "./aiSdk";
 import { claudeCodeModelAlias, isClaudeCodeEnabled } from "./models";
 import type {
@@ -278,6 +281,24 @@ function idleError(ms: number): Error {
   );
 }
 
+function deadlineError(ms: number): Error {
+  return new Error(
+    `Claude Code did not finish within ${Math.round(ms / 60_000)} minutes.`,
+  );
+}
+
+/**
+ * The total budget for a turn. Unlike the idle watchdog this never pauses:
+ * a turn that keeps emitting output or tool calls but never converges is
+ * exactly what it exists to stop.
+ */
+function startDeadline(
+  ms: number,
+  onExpiry: () => void,
+): NodeJS.Timeout | undefined {
+  return ms ? setTimeout(onExpiry, ms).unref() : undefined;
+}
+
 function linkAbort(signal: AbortSignal | undefined): AbortController {
   const controller = new AbortController();
   if (signal?.aborted) controller.abort(signal.reason);
@@ -307,9 +328,15 @@ export async function streamClaudeCode(
   const ids = new ToolUseIdQueue();
 
   const idleMs = claudeCodeIdleTimeoutMs();
+  const timeoutMs = claudeCodeTimeoutMs();
   let idleTimedOut = false;
+  let deadlineExpired = false;
   const watchdog = new IdleWatchdog(idleMs, () => {
     idleTimedOut = true;
+    abortController.abort();
+  });
+  const deadline = startDeadline(timeoutMs, () => {
+    deadlineExpired = true;
     abortController.abort();
   });
 
@@ -409,16 +436,19 @@ export async function streamClaudeCode(
   } catch (error) {
     if (toolFailure !== undefined) throw toolFailure;
     if (params.abortSignal?.aborted) throw abortError(params.abortSignal);
+    if (deadlineExpired) throw deadlineError(timeoutMs);
     if (idleTimedOut) throw idleError(idleMs);
     throw error;
   } finally {
     watchdog.stop();
+    if (deadline) clearTimeout(deadline);
     closeThinking();
     q.close();
   }
 
   if (toolFailure !== undefined) throw toolFailure;
   if (params.abortSignal?.aborted) throw abortError(params.abortSignal);
+  if (deadlineExpired) throw deadlineError(timeoutMs);
   if (idleTimedOut) throw idleError(idleMs);
   return { fullText };
 }
@@ -430,12 +460,18 @@ export async function completeClaudeCode(
   assertEnabled();
   const { query } = sdk ?? (await loadSdk());
   // Title generation is awaited before the chat stream closes, so it gets the
-  // same silence guard as a streamed turn. It runs no tools, so no pausing.
+  // same time bounds as a streamed turn. It runs no tools, so no pausing.
   const idleMs = claudeCodeIdleTimeoutMs();
+  const timeoutMs = claudeCodeTimeoutMs();
   let idleTimedOut = false;
+  let deadlineExpired = false;
   const abortController = new AbortController();
   const watchdog = new IdleWatchdog(idleMs, () => {
     idleTimedOut = true;
+    abortController.abort();
+  });
+  const deadline = startDeadline(timeoutMs, () => {
+    deadlineExpired = true;
     abortController.abort();
   });
   const q = query({
@@ -457,12 +493,15 @@ export async function completeClaudeCode(
       return message.subtype === "success" ? message.result : "";
     }
   } catch (error) {
+    if (deadlineExpired) throw deadlineError(timeoutMs);
     if (idleTimedOut) throw idleError(idleMs);
     throw error;
   } finally {
     watchdog.stop();
+    if (deadline) clearTimeout(deadline);
     q.close();
   }
+  if (deadlineExpired) throw deadlineError(timeoutMs);
   if (idleTimedOut) throw idleError(idleMs);
   throw new Error("Claude Code returned no result.");
 }
