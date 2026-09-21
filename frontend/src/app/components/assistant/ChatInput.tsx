@@ -4,9 +4,12 @@ import {
     useState,
     useCallback,
     useEffect,
+    useLayoutEffect,
     useRef,
     forwardRef,
     useImperativeHandle,
+    useMemo,
+    type ForwardedRef,
 } from "react";
 import {
     ArrowRight,
@@ -67,9 +70,11 @@ import {
     partitionSupportedDocumentFiles,
 } from "@/app/lib/documentUploadValidation";
 import { userFacingApiError } from "@/app/lib/userFacingError";
+import { useConfiguredModels } from "@/app/hooks/useConfiguredModels";
 
 export interface ChatInputHandle {
     addDoc: (doc: Document) => void;
+    addFiles: (files: File[]) => void;
     startWorkflow: (
         workflow: { id: string; title: string },
         prompt?: string,
@@ -89,13 +94,31 @@ interface Props {
      * Whether the caller may write into this chat. False renders a read-only
      * composer — sending, attaching, and drop-uploads stay off, matching
      * what the server would refuse for a project viewer.
+     *
+     * `null` means the answer has not arrived. The composer is closed exactly
+     * as for `false`, but the placeholder stays neutral: telling an owner
+     * "Viewing only — sending needs edit access" for the length of a fetch,
+     * on every cold load, is a wrong statement about their access, not a
+     * loading state.
      */
-    canSend?: boolean;
+    canSend?: boolean | null;
+    /**
+     * Whether this chat's history is still on its way. Kept apart from
+     * `canSend` on purpose: both close the composer, but only one of them is
+     * about permissions, and saying the wrong one is a lie to the reader.
+     * While an answer is still streaming into the thread `isLoading` is set
+     * too, and the composer says so.
+     */
+    chatLoading?: boolean;
     hideAddDocButton?: boolean;
     hideWorkflowButton?: boolean;
     projectName?: string;
     projectCmNumber?: string | null;
     projectId?: string;
+    /** Whether window-level file drops should be captured by this composer. */
+    enableGlobalFileDrop?: boolean;
+    /** Whether dropped files should be added to the project or only attached. */
+    dropUploadsToProject?: boolean;
     onDocumentsUploaded?: (documents: Document[]) => void;
     onDocumentClick?: (document: Document) => void;
     chatModel?: string | null;
@@ -103,25 +126,56 @@ interface Props {
     chatKey?: string | null;
 }
 
-export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
+/**
+ * What the closed composer tells the reader.
+ *
+ * Order matters. A reader without edit access is told about the grant even
+ * while the thread loads, because that is the reason that will still be true
+ * afterwards. Otherwise a load in progress explains itself — and when a
+ * response is running (a turn started before the reader left keeps
+ * `isLoading` set when they come back) it says which one, instead of
+ * inventing a permission problem.
+ */
+function placeholderFor({
+    canSend,
+    chatLoading,
+    isLoading,
+}: {
+    canSend: boolean | null;
+    chatLoading: boolean;
+    isLoading: boolean;
+}): string {
+    if (canSend === null) return "Loading…";
+    if (!canSend) return "Viewing only — sending needs edit access";
+    if (!chatLoading) return "How can I help?";
+    return isLoading ? "A response is still arriving…" : "Loading this chat…";
+}
+
+function ChatInputForChatImpl(
     {
         onSubmit,
         onCancel,
         isLoading,
         canSend = true,
+        chatLoading = false,
         hideAddDocButton,
         hideWorkflowButton,
         projectName,
         projectCmNumber,
         projectId,
+        enableGlobalFileDrop = true,
+        dropUploadsToProject = true,
         onDocumentsUploaded,
         onDocumentClick,
         chatModel,
         chatReasoningLevel,
         chatKey,
     }: Props,
-    ref,
+    ref: ForwardedRef<ChatInputHandle>,
 ) {
+    // Sending needs both a grant and a loaded thread; the placeholder below
+    // names whichever one is missing.
+    const composerOpen = canSend === true && !chatLoading;
     const [value, setValue] = useState("");
     const [attachedDocs, setAttachedDocs] = useState<Document[]>([]);
     const [selectedWorkflow, setSelectedWorkflow] = useState<{
@@ -135,6 +189,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
         persistChatModelSelection,
         persistChatReasoningSelection,
     } = useUserProfile();
+    const configuredModels = useConfiguredModels();
+    const configuredModelIds = useMemo(
+        () => configuredModels.map((model) => model.id),
+        [configuredModels],
+    );
     // A degraded profile is the local fallback, whose router lists are empty
     // because the truth is UNKNOWN. Passing them on would let one dropped
     // /user/profile request rewrite the saved composer selection to the
@@ -153,6 +212,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                   }
                 : null,
         apiKeys: apiKeysDegraded ? undefined : profile?.apiKeys,
+        configuredModelIds,
     });
     // Degraded profile → key availability is UNKNOWN; undefined here makes
     // every key gate (submit check + model toggle) fail open instead of
@@ -193,6 +253,16 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
     const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
     const dragDepthRef = useRef(0);
     const settingsSaveRef = useRef<Promise<boolean>>(Promise.resolve(true));
+    // `ChatInput` keys this component by chat. Mark this generation inactive
+    // during the keyed unmount so upload callbacks from the previous thread
+    // cannot mutate its replacement or call outward with stale documents.
+    const uploadGenerationActiveRef = useRef(true);
+    useLayoutEffect(() => {
+        uploadGenerationActiveRef.current = true;
+        return () => {
+            uploadGenerationActiveRef.current = false;
+        };
+    }, []);
 
     const handleModelChange = useCallback(
         (nextModel: string) => {
@@ -240,33 +310,6 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
         activeSlashIndex,
         Math.max(0, matchingWorkflows.length - 1),
     );
-
-    useImperativeHandle(ref, () => ({
-        addDoc: (doc: Document) => {
-            setAttachedDocs((prev) => {
-                if (prev.some((d) => d.id === doc.id)) return prev;
-                return [...prev, doc];
-            });
-        },
-        startWorkflow: (workflow, prompt) => {
-            setSelectedWorkflow(workflow);
-            if (prompt !== undefined) setValue(prompt);
-            requestAnimationFrame(() => textareaRef.current?.focus());
-        },
-        startWorkflowDocumentSelection: (workflow, prompt, options) => {
-            setSelectedWorkflow(workflow);
-            setDocSelectorInitialTab(options?.initialDocumentTab ?? "files");
-            if (prompt !== undefined) {
-                setValue(prompt);
-                requestAnimationFrame(() => {
-                    if (!textareaRef.current) return;
-                    textareaRef.current.style.height = "auto";
-                    textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
-                });
-            }
-            setDocSelectorOpen(true);
-        },
-    }));
 
     useEffect(() => {
         const el = controlsRef.current;
@@ -320,10 +363,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
 
     const handleDroppedFiles = useCallback(
         async (files: File[]) => {
-            if (!canSend) {
-                setUploadWarning(
-                    "Only someone with edit access can add documents.",
-                );
+            if (!composerOpen) {
+                if (canSend === false) {
+                    setUploadWarning(
+                        "Only someone with edit access can add documents.",
+                    );
+                }
                 return;
             }
             const { supported, unsupported } =
@@ -342,6 +387,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                 })),
             );
             const addCompletedDocument = (document: Document) => {
+                if (!uploadGenerationActiveRef.current) return;
                 addAttachedDocuments([document]);
                 setDroppedDocuments((prev) => {
                     const existing = new Set(
@@ -354,6 +400,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                 });
             };
             const handleProgress = (progress: UploadProgress<Document>) => {
+                if (!uploadGenerationActiveRef.current) return;
                 if (
                     progress.status === "completed" ||
                     progress.status === "error"
@@ -369,24 +416,29 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                 }
             };
             try {
-                const outcomes = projectId
+                const uploadsToProject = dropUploadsToProject && !!projectId;
+                const outcomes = uploadsToProject
                     ? await uploadProjectDocuments(projectId, uploadInputs, {
                           onProgress: handleProgress,
                       })
                     : await uploadStandaloneDocuments(uploadInputs, {
                           onProgress: handleProgress,
                       });
+                if (!uploadGenerationActiveRef.current) return;
                 const uploaded = outcomes.flatMap((outcome) =>
                     outcome.status === "completed" && outcome.result
                         ? [outcome.result]
                         : [],
                 );
                 uploaded.forEach(addCompletedDocument);
-                if (uploaded.length > 0) onDocumentsUploaded?.(uploaded);
+                if (uploadsToProject && uploaded.length > 0) {
+                    onDocumentsUploaded?.(uploaded);
+                }
                 if (outcomes.some((outcome) => outcome.status === "error")) {
                     setUploadWarning(failedUploadMessage(outcomes));
                 }
             } catch (error) {
+                if (!uploadGenerationActiveRef.current) return;
                 setUploadWarning(
                     error instanceof UploadBatchError
                         ? failedUploadMessage(error.outcomes)
@@ -396,13 +448,51 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                           ),
                 );
             } finally {
-                setUploadingFiles([]);
+                if (uploadGenerationActiveRef.current) setUploadingFiles([]);
             }
         },
-        [addAttachedDocuments, canSend, onDocumentsUploaded, projectId],
+        [
+            addAttachedDocuments,
+            canSend,
+            composerOpen,
+            dropUploadsToProject,
+            onDocumentsUploaded,
+            projectId,
+        ],
     );
 
+    useImperativeHandle(ref, () => ({
+        addDoc: (doc: Document) => {
+            setAttachedDocs((prev) => {
+                if (prev.some((d) => d.id === doc.id)) return prev;
+                return [...prev, doc];
+            });
+        },
+        addFiles: (files: File[]) => {
+            void handleDroppedFiles(files);
+        },
+        startWorkflow: (workflow, prompt) => {
+            setSelectedWorkflow(workflow);
+            if (prompt !== undefined) setValue(prompt);
+            requestAnimationFrame(() => textareaRef.current?.focus());
+        },
+        startWorkflowDocumentSelection: (workflow, prompt, options) => {
+            setSelectedWorkflow(workflow);
+            setDocSelectorInitialTab(options?.initialDocumentTab ?? "files");
+            if (prompt !== undefined) {
+                setValue(prompt);
+                requestAnimationFrame(() => {
+                    if (!textareaRef.current) return;
+                    textareaRef.current.style.height = "auto";
+                    textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+                });
+            }
+            setDocSelectorOpen(true);
+        },
+    }));
+
     useEffect(() => {
+        if (!enableGlobalFileDrop || !composerOpen) return;
         const hasFiles = (dataTransfer: DataTransfer | null) =>
             !!dataTransfer && Array.from(dataTransfer.types).includes("Files");
 
@@ -443,7 +533,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
             window.removeEventListener("dragleave", handleDragLeave);
             window.removeEventListener("drop", handleDrop);
         };
-    }, [handleDroppedFiles]);
+    }, [composerOpen, enableGlobalFileDrop, handleDroppedFiles]);
 
     const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
         setValue(e.target.value);
@@ -463,7 +553,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
             setModelRequiredWarning(true);
             return;
         }
-        if (apiKeys && !isModelAvailable(model, apiKeys)) {
+        if (
+            apiKeys &&
+            !isModelAvailable(model, apiKeys, configuredModelIds)
+        ) {
             setApiKeyModalProvider(getModelProvider(model));
             return;
         }
@@ -511,7 +604,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
 
     const handleSubmit = () => {
         const query = value.trim();
-        if (!canSend || slashCommandsLoading) return;
+        if (!composerOpen || slashCommandsLoading) return;
         const slashWorkflow = slashQuery
             ? exactSlashWorkflow(slashWorkflows ?? [], slashQuery)
             : undefined;
@@ -686,12 +779,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                         <textarea
                             ref={textareaRef}
                             rows={1}
-                            disabled={!canSend}
-                            placeholder={
-                                canSend
-                                    ? "How can I help?"
-                                    : "Viewing only — sending needs edit access"
-                            }
+                            disabled={!composerOpen}
+                            placeholder={placeholderFor({
+                                canSend,
+                                chatLoading,
+                                isLoading,
+                            })}
                             value={value}
                             onChange={handleChange}
                             onKeyDown={handleKeyDown}
@@ -718,7 +811,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                         className="flex items-center justify-between p-2.5"
                     >
                         <div className="flex items-center gap-1">
-                            {!hideAddDocButton && canSend && (
+                            {!hideAddDocButton && composerOpen && (
                                 <AddDocButton
                                     onBrowseAll={() => {
                                         setDocSelectorInitialTab("files");
@@ -730,7 +823,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                                     hideLabel={compactControls}
                                 />
                             )}
-                            {!hideWorkflowButton && canSend && (
+                            {!hideWorkflowButton && composerOpen && (
                                 <button
                                     type="button"
                                     onClick={() => {
@@ -792,10 +885,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                                 )}
                                 onClick={handleActionClick}
                                 disabled={
-                                    !canSend ||
-                                    (!isLoading &&
-                                        (!value.trim() ||
-                                            slashCommandsLoading))
+                                    !isLoading &&
+                                    (!composerOpen ||
+                                        !value.trim() ||
+                                        slashCommandsLoading)
                                 }
                             >
                                 {isLoading ? (
@@ -821,7 +914,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                 initialSelectedDocuments={attachedDocs}
                 externalUploadedDocuments={droppedDocuments}
                 initialTab={docSelectorInitialTab}
-                projectId={projectId}
+                projectId={dropUploadsToProject ? projectId : undefined}
                 uploadStateId={`assistant-chat:${projectId ?? "standalone"}`}
                 breadcrumb={
                     selectedWorkflow
@@ -845,7 +938,6 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
             />
             <ApiKeyMissingPopup
                 open={apiKeyModalProvider !== null}
-                provider={apiKeyModalProvider}
                 onClose={() => setApiKeyModalProvider(null)}
             />
             <NoModelsWarningPopup
@@ -864,5 +956,25 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                 onWarningClose={() => setUploadWarning(null)}
             />
         </>
+    );
+}
+
+const ChatInputForChat = forwardRef<ChatInputHandle, Props>(ChatInputForChatImpl);
+
+/**
+ * Chat composer whose draft and asynchronous uploads belong to one chat key.
+ * Changing the key remounts the stateful implementation; its layout cleanup
+ * invalidates callbacks before the replacement composer can be displayed.
+ */
+export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
+    props,
+    ref,
+) {
+    return (
+        <ChatInputForChat
+            key={props.chatKey ?? "new-chat"}
+            {...props}
+            ref={ref}
+        />
     );
 });

@@ -30,6 +30,10 @@ description = "Word add-in e2e fixture: mocked session token for the hermetic au
 regexes = ['''^valid-jwt-123$''']
 
 [[allowlists]]
+description = "Observability redaction fixtures: deliberately fake AWS access-key-shaped value used to prove nested event data is scrubbed"
+regexes = ['''^AKIAABCDEFGHIJKLMNOP$''']
+
+[[allowlists]]
 description = "Supabase's public demo JWTs (iss: supabase-demo, HS256-signed with the published demo secret — the well-known local-dev anon/service_role keys from Supabase's own docs) in .env.example / docker-compose.yml history"
 regexes = [
     '''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9\.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0$''',

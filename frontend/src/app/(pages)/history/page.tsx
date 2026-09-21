@@ -30,14 +30,15 @@ import {
 } from "@/app/components/shared/TablePrimitive";
 import { TableToolbar } from "@/app/components/shared/TableToolbar";
 import { HistorySkeuoIcon } from "@/app/components/shared/HistorySkeuoIcon";
-import { PillButton } from "@/app/components/ui/pill-button";
-import { TabPillButton } from "@/app/components/ui/tab-pill-button";
+import { PillButtonUI } from "@/shared/ui/PillButtonUI";
+import { TabPillButtonUI } from "@/shared/ui/TabPillButtonUI";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
 } from "@/app/components/ui/dropdown-menu";
 import { LiquidDropdownContent } from "@/app/components/ui/liquid-dropdown";
 import { cn } from "@/app/lib/utils";
+import { WarningPopup } from "@/app/components/popups/WarningPopup";
 
 const ACTION_LABELS: Record<string, string> = {
   "chat.message": "Chat",
@@ -70,6 +71,7 @@ const GLASS_DOT =
 const SURFACE_LABELS: Record<string, string> = {
   assistant: "Assistant",
   project: "Project",
+  word: "Word",
   tabular: "Tabular",
   workflows: "Workflows",
   account: "Account",
@@ -157,6 +159,7 @@ export default function HistoryPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [exportWarningOpen, setExportWarningOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [action, setAction] = useState<string | null>(null);
@@ -245,7 +248,7 @@ export default function HistoryPage() {
       anchor.click();
       URL.revokeObjectURL(url);
     } catch {
-      alert("Export failed.");
+      setExportWarningOpen(true);
     } finally {
       setExporting(false);
     }
@@ -411,13 +414,13 @@ export default function HistoryPage() {
               <p className="mt-1 text-xs text-gray-400">
                 Your activity could not be loaded.
               </p>
-              <PillButton
+              <PillButtonUI
                 tone="white"
                 className="mt-4"
                 onClick={() => void load(1, false)}
               >
                 Try again
-              </PillButton>
+              </PillButtonUI>
             </TableEmptyState>
           </TableBody>
         ) : events.length === 0 ? (
@@ -497,17 +500,23 @@ export default function HistoryPage() {
             )}
             {!loading && events.length < total && (
               <div className="flex justify-center py-3">
-                <PillButton
+                <PillButtonUI
                   tone="white"
                   onClick={() => void load(page + 1, true)}
                 >
                   Load more ({events.length} of {total})
-                </PillButton>
+                </PillButtonUI>
               </div>
             )}
           </TableBody>
         )}
       </TableScrollArea>
+      <WarningPopup
+        open={exportWarningOpen}
+        title="Export failed"
+        message="Your history could not be exported. Please try again."
+        onClose={() => setExportWarningOpen(false)}
+      />
     </div>
   );
 }
@@ -539,10 +548,10 @@ function DateRangeDropdown({
   return (
     <DropdownMenu open={open} onOpenChange={handleOpenChange}>
       <DropdownMenuTrigger asChild>
-        <TabPillButton active aria-label="Select date range">
+        <TabPillButtonUI active aria-label="Select date range">
           <CalendarDays className="h-3.5 w-3.5" />
           {formatRangeDate(from)} – {formatRangeDate(to)}
-        </TabPillButton>
+        </TabPillButtonUI>
       </DropdownMenuTrigger>
       <LiquidDropdownContent
         align="start"
@@ -579,13 +588,13 @@ function DateRangeDropdown({
           />
         </div>
         <div className="flex justify-end pt-3">
-          <PillButton
+          <PillButtonUI
             tone="black"
             disabled={!hasChanges}
             onClick={handleConfirm}
           >
             Confirm
-          </PillButton>
+          </PillButtonUI>
         </div>
       </LiquidDropdownContent>
     </DropdownMenu>

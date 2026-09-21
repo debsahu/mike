@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { Trash2 } from "lucide-react";
-import { PillButton } from "@/app/components/ui/pill-button";
+import { PillButtonUI } from "@/shared/ui/PillButtonUI";
 import { Modal } from "@/app/components/modals/Modal";
 import { FieldLabel } from "@/app/components/ui/form-field";
 import { SettingsTextInput } from "@/app/components/settings/SettingsTextInput";
@@ -16,6 +16,7 @@ import {
 } from "@/app/components/popups/MfaVerificationPopup";
 import { WarningPopup } from "@/app/components/popups/WarningPopup";
 import { deleteAccount, isMfaRequiredError } from "@/app/lib/mikeApi";
+import { userFacingApiError } from "@/app/lib/userFacingError";
 import {
   SettingsDescription,
   SettingsLabel,
@@ -56,6 +57,7 @@ export default function SettingsPage() {
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [accountDeleteMfaOpen, setAccountDeleteMfaOpen] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const requiresPasswordForEmailChange =
     user?.createdWithGoogle === true && profile?.passwordSet !== true;
 
@@ -100,6 +102,7 @@ export default function SettingsPage() {
   const handleDeleteAccount = async () => {
     devLog("[account/mfa] delete account requested");
     setIsDeleting(true);
+    setDeleteError(null);
     try {
       if (await needsMfaVerification()) {
         setDeleteConfirm(false);
@@ -122,7 +125,16 @@ export default function SettingsPage() {
         return;
       }
       setDeleteConfirm(false);
-      alert("Failed to delete account. Please try again.");
+      // Deletion can be refused for a reason only the user can act on —
+      // a 409 naming the organization they are the last admin of, for
+      // instance. That is an intentional 4xx detail, so it is shown
+      // verbatim; the session is untouched because nothing was deleted.
+      setDeleteError(
+        userFacingApiError(
+          error,
+          "Your account could not be deleted. Please try again.",
+        ),
+      );
     }
   };
 
@@ -374,7 +386,7 @@ export default function SettingsPage() {
                 action cannot be undone.
               </SettingsDescription>
             </div>
-            <PillButton
+            <PillButtonUI
               tone="danger"
               size="sm"
               onClick={() => setDeleteConfirm(true)}
@@ -384,7 +396,7 @@ export default function SettingsPage() {
             >
               <Trash2 className="h-4 w-4 shrink-0" />
               Delete account
-            </PillButton>
+            </PillButtonUI>
           </SettingsRow>
         </SettingsCard>
       </section>
@@ -401,6 +413,12 @@ export default function SettingsPage() {
           setDeleteConfirm(false);
         }}
         onConfirm={() => void handleDeleteAccount()}
+      />
+      <WarningPopup
+        open={deleteError !== null}
+        title="Account deletion failed"
+        message={deleteError}
+        onClose={() => setDeleteError(null)}
       />
       <WarningPopup
         open={!!emailWarning}

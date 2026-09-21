@@ -539,8 +539,10 @@ create table if not exists public.projects (
   -- user_id is provenance ("who made this"), not the access rule — that flows
   -- from project_access_grants and org membership (lib/access.ts).
   user_id uuid references auth.users(id) on delete set null,
-  -- Multi-tenant: nullable so system/global rows stay valid; user_id remains
-  -- the hard cascade anchor (org_id uses SET NULL, not CASCADE).
+  -- Multi-tenant: nullable so system/global rows stay valid. The FK is
+  -- RESTRICT, so an organization holding projects cannot be deleted at all --
+  -- the API answers 409 (lib/orgs.ts deleteOrg) rather than letting the
+  -- database strand a firm's matters.
   org_id uuid references public.organizations(id) on delete restrict,
   name text not null,
   cm_number text,
@@ -851,6 +853,9 @@ create table if not exists public.upload_session_files (
   status text not null default 'pending_upload',
   error_code text,
   result jsonb,
+  -- Set once the worker has written the destination documents row, so a
+  -- retry can tell "never created" from "created, then deleted by the user".
+  document_created_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint upload_session_files_client_id_check
@@ -1004,7 +1009,13 @@ create table if not exists public.workflow_shares (
     check (role in ('owner', 'editor', 'viewer')),
   created_at timestamptz not null default now(),
   constraint workflow_shares_workflow_email_unique
-    unique(workflow_id, shared_with_email)
+    unique(workflow_id, shared_with_email),
+  -- Canonical case, like every sibling grant table (project_access_grants,
+  -- chat_access_grants, tabular_review_access_grants, org_invitations).
+  -- Without it the unique constraint above treats A@x.com and a@x.com as two
+  -- different recipients while the access lookups treat them as one.
+  constraint workflow_shares_email_lowercase
+    check (shared_with_email = lower(shared_with_email))
 );
 
 create index if not exists workflow_shares_workflow_id_idx
@@ -1063,10 +1074,16 @@ as $$
     )
     when p_workflow_user_id::text = p_user_id then 'owner'
     else (
+      -- BOTH sides lowered. get_workflows_overview lists a share with
+      -- lower() on both, so a legacy mixed-case row listed for its recipient
+      -- and then 404'd the moment they opened it (and re-sharing produced a
+      -- second row rather than updating the first). The 02 migration
+      -- normalizes the stored values and adds a lowercase CHECK; this stays
+      -- symmetrical with the overview regardless.
       select s.role from public.workflow_shares s
       where s.workflow_id = p_workflow_id
         and coalesce(p_user_email, '') <> ''
-        and s.shared_with_email = lower(p_user_email)
+        and lower(s.shared_with_email) = lower(p_user_email)
       limit 1
     )
   end;
@@ -1934,8 +1951,6 @@ create table if not exists public.chat_messages (
   created_at timestamptz not null default now()
 );
 
-create index if not exists idx_chat_messages_chat
-  on public.chat_messages(chat_id);
 create index if not exists chat_messages_chat_created_id_idx
   on public.chat_messages(chat_id, created_at, id);
 create index if not exists chat_messages_author_idx
@@ -2225,6 +2240,42 @@ create index if not exists idx_tabular_review_access_grants_review
   on public.tabular_review_access_grants(tabular_review_id);
 
 alter table public.tabular_review_access_grants enable row level security;
+
+-- Archive of direct review shares that the organization model has nowhere to
+-- put. On main, a tabular review inside a project could ALSO carry its own
+-- shared_with list, and access.ts honoured it. In this model a
+-- project-contained review inherits access exclusively from its project --
+-- validate_direct_access_scope refuses a review-level grant on one -- so the
+-- 20260904_02 data migration cannot convert those recipients into grants.
+--
+-- Promoting them to project viewer grants was considered and REJECTED: a
+-- share on one review is not consent to see the whole matter, and silently
+-- widening access is a worse failure than losing it. Silently DESTROYING the
+-- shares is not acceptable either, so the migration copies the discarded
+-- (review, project, email) triples here. An operator can read this table and
+-- re-grant access at project level deliberately, per recipient, with the
+-- context to judge it. Fresh installs create it empty.
+create table if not exists public.tabular_review_legacy_shares (
+  id uuid primary key default gen_random_uuid(),
+  -- NEITHER id is a foreign key. This is a historical record of who lost
+  -- access at upgrade, and it must survive the rows it describes: an ON
+  -- DELETE CASCADE to tabular_reviews meant deleting the review -- or the
+  -- project, which cascades to its reviews -- destroyed the only record of
+  -- the recipients an operator was supposed to re-grant.
+  tabular_review_id uuid not null,
+  -- The project the review sat in when the share was archived.
+  project_id uuid,
+  email text not null,
+  archived_at timestamptz not null default now(),
+  unique(tabular_review_id, email),
+  constraint tabular_review_legacy_shares_email_lowercase
+    check (email = lower(email))
+);
+
+create index if not exists idx_tabular_review_legacy_shares_review
+  on public.tabular_review_legacy_shares(tabular_review_id);
+
+alter table public.tabular_review_legacy_shares enable row level security;
 
 create or replace function public.review_access_role(
   p_review_id uuid,
@@ -4681,6 +4732,29 @@ create table if not exists public.memory_consolidation_results (
   created_at timestamptz not null default now(),
   primary key(job_id, memory_file_id)
 );
+-- The composite primary key cannot serve the ON DELETE CASCADE lookup from
+-- memory_files, and the retention sweep deletes by age.
+create index if not exists memory_consolidation_results_file_idx
+  on public.memory_consolidation_results(memory_file_id);
+create index if not exists memory_consolidation_results_created_idx
+  on public.memory_consolidation_results(created_at);
+-- User-referencing columns whose parent rows are deleted (account deletion)
+-- need an index or the cascade scans every memory table.
+create index if not exists memory_files_updated_by_idx
+  on public.memory_files(updated_by) where updated_by is not null;
+create index if not exists memory_consolidation_states_actor_idx
+  on public.memory_consolidation_states(actor_user_id);
+create index if not exists memory_conversation_activity_actor_idx
+  on public.memory_conversation_activity(actor_user_id)
+  where actor_user_id is not null;
+create index if not exists memory_conversation_activity_turn_actor_idx
+  on public.memory_conversation_activity(latest_turn_actor_user_id)
+  where latest_turn_actor_user_id is not null;
+create index if not exists memory_conversation_activity_project_actor_idx
+  on public.memory_conversation_activity(project_curator_actor_user_id)
+  where project_curator_actor_user_id is not null;
+create index if not exists memory_conversation_turn_leases_actor_idx
+  on public.memory_conversation_turn_leases(actor_user_id);
 
 alter table public.memory_files enable row level security;
 alter table public.memory_consolidation_states enable row level security;
@@ -4702,7 +4776,7 @@ create or replace function public.initialize_new_user_memory()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   insert into public.memory_files(scope, user_id, enabled)
@@ -4728,7 +4802,7 @@ create or replace function public.create_project_with_memory(
 returns public.projects
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   created public.projects%rowtype;
@@ -4747,6 +4821,10 @@ drop function if exists public.invalidate_memory_conversation(
   text, uuid, uuid, uuid, uuid
 );
 
+-- Conflicts raise P0001, never 40001: PostgREST treats a serialization
+-- failure as retryable and never answers the request, which hung every
+-- manual write that lost a compare-and-swap race and every curator job that
+-- hit a superseded generation.
 create or replace function public.lock_memory_conversation_source(
   p_surface text,
   p_conversation_id uuid,
@@ -4755,7 +4833,7 @@ create or replace function public.lock_memory_conversation_source(
 returns table(locked_project_id uuid)
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   owner_user_id uuid;
@@ -4764,6 +4842,8 @@ declare
   verified_project_id uuid;
   review_id uuid;
   verified_review_id uuid;
+  review_owner_user_id uuid;
+  verified_review_owner_user_id uuid;
   word_document_id uuid;
   verified_word_document_id uuid;
 begin
@@ -4788,7 +4868,7 @@ begin
       or verified_owner_user_id is distinct from owner_user_id
       or verified_project_id is distinct from resolved_project_id
     then
-      raise exception using errcode = '40001', message = 'memory_source_changed';
+      raise exception using errcode = 'P0001', message = 'memory_source_changed';
     end if;
   elsif p_surface = 'word' then
     select source.user_id, source.word_document_id
@@ -4809,18 +4889,18 @@ begin
       or verified_owner_user_id is distinct from owner_user_id
       or verified_word_document_id is distinct from word_document_id
     then
-      raise exception using errcode = '40001', message = 'memory_source_changed';
+      raise exception using errcode = 'P0001', message = 'memory_source_changed';
     end if;
     resolved_project_id := null;
   elsif p_surface = 'tabular' then
     select source.user_id, source.review_id, review.user_id, review.project_id
-    into owner_user_id, review_id, verified_owner_user_id, resolved_project_id
+    into owner_user_id, review_id, review_owner_user_id, resolved_project_id
     from public.tabular_review_chats source
     join public.tabular_reviews review on review.id = source.review_id
     where source.id = p_conversation_id;
     if not found then return; end if;
     perform actor.id from auth.users actor
-    where actor.id in (p_actor_user_id, owner_user_id, verified_owner_user_id)
+    where actor.id in (p_actor_user_id, owner_user_id, review_owner_user_id)
     order by actor.id for key share;
     if resolved_project_id is not null then
       perform project.id from public.projects project
@@ -4832,15 +4912,17 @@ begin
     if not found then return; end if;
     select source.user_id, source.review_id, review.user_id, review.project_id
     into verified_owner_user_id, verified_review_id,
-      owner_user_id, verified_project_id
+      verified_review_owner_user_id, verified_project_id
     from public.tabular_review_chats source
     join public.tabular_reviews review on review.id = source.review_id
     where source.id = p_conversation_id for key share of source, review;
     if not found
+      or verified_owner_user_id is distinct from owner_user_id
       or verified_review_id is distinct from review_id
+      or verified_review_owner_user_id is distinct from review_owner_user_id
       or verified_project_id is distinct from resolved_project_id
     then
-      raise exception using errcode = '40001', message = 'memory_source_changed';
+      raise exception using errcode = 'P0001', message = 'memory_source_changed';
     end if;
   else
     raise exception using errcode = '22023', message = 'invalid_memory_surface';
@@ -4863,7 +4945,7 @@ create or replace function public.begin_memory_conversation_turn(
 returns table(conversation_generation bigint, source_epoch bigint)
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   activity public.memory_conversation_activity%rowtype;
@@ -4888,7 +4970,7 @@ begin
     p_surface, p_conversation_id, p_actor_user_id
   ) locked;
   if not found then
-    raise exception using errcode = '40001', message = 'memory_conversation_deleted';
+    raise exception using errcode = 'P0001', message = 'memory_conversation_deleted';
   end if;
 
   insert into public.memory_conversation_activity(
@@ -4899,12 +4981,17 @@ begin
   select * into activity from public.memory_conversation_activity
   where surface = p_surface and conversation_id = p_conversation_id for update;
   if activity.deleted_at is not null then
-    raise exception using errcode = '40001', message = 'memory_conversation_deleted';
+    raise exception using errcode = 'P0001', message = 'memory_conversation_deleted';
   end if;
 
+  -- Only garbage is reaped here. An expired lease is already ignored by every
+  -- gate, but the successful-turn scheduler proves its activity id by deleting
+  -- its own lease row: reaping a row the moment it expired made a turn that
+  -- outlived its lease (a long tool loop) silently unlearnable as soon as
+  -- anyone else spoke in the conversation.
   delete from public.memory_conversation_turn_leases
   where surface = p_surface and conversation_id = p_conversation_id
-    and expires_at <= now();
+    and expires_at <= now() - interval '1 day';
   insert into public.memory_conversation_turn_leases(
     surface, conversation_id, activity_id, actor_user_id, expires_at
   ) values (
@@ -4926,11 +5013,13 @@ begin
   where surface = p_surface and conversation_id = p_conversation_id;
 
   -- A claimed worker is fenced again during promotion. Pending work is moved
-  -- only a short interval so a crashed stream is retried until its lease dies.
+  -- one quiet window: a turn that completes or is released retimes it
+  -- itself, so only a crashed stream ever waits this long, and it is retried
+  -- until its lease dies.
   update public.db_jobs
   set run_at = greatest(
         run_at,
-        least(lease_until, now() + interval '1 minute')
+        least(lease_until, now() + make_interval(secs => p_quiet_seconds))
       )
   where kind = 'memory.consolidate' and status = 'pending'
     and payload->>'surface' = p_surface
@@ -4938,7 +5027,7 @@ begin
   update public.memory_consolidation_states
   set run_after = greatest(
         coalesce(run_after, '-infinity'::timestamptz),
-        least(lease_until, now() + interval '1 minute')
+        least(lease_until, now() + make_interval(secs => p_quiet_seconds))
       ),
       updated_at = now()
   where surface = p_surface and conversation_id = p_conversation_id
@@ -4960,7 +5049,7 @@ create or replace function public.release_memory_conversation_turn(
 returns boolean
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   activity public.memory_conversation_activity%rowtype;
@@ -4988,8 +5077,12 @@ begin
       ),
       updated_at = now()
   where surface = p_surface and conversation_id = p_conversation_id;
+  -- A released turn is the earliest this conversation can be quiet again.
+  -- Pending work moves there in both directions: later when the turn had
+  -- interrupted a nearly-due job, earlier when a worker had deferred the job
+  -- behind this turn's lease.
   update public.db_jobs
-  set run_at = greatest(run_at, next_quiet_until)
+  set run_at = next_quiet_until
   where kind = 'memory.consolidate' and status = 'pending'
     and payload->>'surface' = p_surface
     and payload->>'conversationId' = p_conversation_id::text;
@@ -5014,7 +5107,7 @@ create or replace function public.fence_memory_conversation_delete()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   fence_surface text := tg_argv[0];
@@ -5074,6 +5167,14 @@ for each row execute function public.fence_memory_conversation_delete('tabular')
 create index if not exists db_jobs_memory_conversation_pending_idx
   on public.db_jobs((payload->>'surface'), (payload->>'conversationId'))
   where kind = 'memory.consolidate' and status = 'pending';
+-- refresh_memory_file_status probes live jobs by actor/app epoch and by
+-- project/project epoch on every status transition.
+create index if not exists db_jobs_memory_app_epoch_idx
+  on public.db_jobs((payload->>'actorUserId'), (payload->>'appEpoch'))
+  where kind = 'memory.consolidate' and status in ('pending', 'running');
+create index if not exists db_jobs_memory_project_epoch_idx
+  on public.db_jobs((payload->>'projectId'), (payload->>'projectEpoch'))
+  where kind = 'memory.consolidate' and status in ('pending', 'running');
 
 -- Atomic batch claim with built-in stale-running recovery (crash resume).
 -- Storage cleanup kinds carry the only durable pointer to objects whose
@@ -5219,8 +5320,32 @@ as $$
        + coalesce((select count(*) from marked), 0)::integer;
 $$;
 
+create or replace function public.memory_project_is_private(
+  p_project_id uuid
+)
+returns boolean
+language sql
+volatile
+security definer
+set search_path = public, pg_temp
+as $$
+  select exists (
+    select 1
+    from public.projects project
+    where project.id = p_project_id
+      and project.org_id is null
+      and not exists (
+        select 1
+        from public.project_access_grants grant_row
+        where grant_row.project_id = project.id
+      )
+  );
+$$;
+
 create or replace function public.memory_source_allows_app_memory(
   p_surface text,
+  p_conversation_id uuid,
+  p_actor_user_id uuid,
   p_project_id uuid
 )
 returns boolean
@@ -5229,22 +5354,48 @@ language sql
 -- could retain the statement's older snapshot while a concurrent share wins.
 volatile
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
+  -- App memory is private to one user, so it may only learn from a
+  -- conversation nobody else can read. That is a property of the
+  -- conversation itself (its owner, organization, and direct grants) and,
+  -- when it lives in a project, of the project too. The read path in the
+  -- routes applies the same three tests before showing app memory.
   select case
     when p_surface = 'word' then p_project_id is null
-    when p_surface = 'chat' and p_project_id is null then true
-    when p_surface in ('chat', 'tabular') and p_project_id is not null then exists (
-      select 1
-      from public.projects project
-      where project.id = p_project_id
-        and project.org_id is null
-        and not exists (
-          select 1
-          from public.project_access_grants grant_row
-          where grant_row.project_id = project.id
-        )
-    )
+    when p_surface = 'chat' then
+      exists (
+        select 1
+        from public.chats chat
+        where chat.id = p_conversation_id
+          and chat.user_id = p_actor_user_id
+          and chat.org_id is null
+          and not exists (
+            select 1
+            from public.chat_access_grants grant_row
+            where grant_row.chat_id = chat.id
+          )
+      )
+      and (
+        p_project_id is null
+        or public.memory_project_is_private(p_project_id)
+      )
+    when p_surface = 'tabular' then
+      p_project_id is not null
+      and exists (
+        select 1
+        from public.tabular_review_chats chat
+        join public.tabular_reviews review on review.id = chat.review_id
+        where chat.id = p_conversation_id
+          and review.user_id = p_actor_user_id
+          and review.org_id is null
+          and not exists (
+            select 1
+            from public.tabular_review_access_grants grant_row
+            where grant_row.tabular_review_id = review.id
+          )
+      )
+      and public.memory_project_is_private(p_project_id)
     else false
   end;
 $$;
@@ -5272,7 +5423,7 @@ create or replace function public.write_memory_file(
 returns table(applied boolean, new_revision bigint)
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   target public.memory_files%rowtype;
@@ -5303,7 +5454,7 @@ begin
       p_source_surface, p_source_chat_id, p_updated_by
     ) locked;
     if not found then
-      raise exception using errcode = '40001', message = 'memory_job_superseded';
+      raise exception using errcode = 'P0001', message = 'memory_job_superseded';
     end if;
     select * into activity from public.memory_conversation_activity
     where surface = p_source_surface and conversation_id = p_source_chat_id
@@ -5313,7 +5464,7 @@ begin
       or activity.source_epoch <> p_source_epoch
       or activity.generation <> p_conversation_generation
     then
-      raise exception using errcode = '40001', message = 'memory_job_superseded';
+      raise exception using errcode = 'P0001', message = 'memory_job_superseded';
     end if;
     if activity.quiet_until is null
       or activity.quiet_until > now()
@@ -5336,7 +5487,7 @@ begin
       or consolidation.source_epoch <> p_source_epoch
       or consolidation.actor_user_id is distinct from p_updated_by
     then
-      raise exception using errcode = '40001', message = 'memory_job_superseded';
+      raise exception using errcode = 'P0001', message = 'memory_job_superseded';
     end if;
   end if;
 
@@ -5360,14 +5511,14 @@ begin
     if (target.scope = 'user' and target.user_id <> consolidation.actor_user_id)
       or (target.scope = 'project' and target.project_id is distinct from consolidation.project_id)
     then
-      raise exception using errcode = '40001', message = 'memory_job_superseded';
+      raise exception using errcode = 'P0001', message = 'memory_job_superseded';
     end if;
     if target.scope = 'user'
       and not public.memory_source_allows_app_memory(
-        p_source_surface, activity.project_id
+        p_source_surface, p_source_chat_id, p_updated_by, activity.project_id
       )
     then
-      raise exception using errcode = '40001', message = 'memory_scope_ineligible';
+      raise exception using errcode = 'P0001', message = 'memory_scope_ineligible';
     end if;
   end if;
 
@@ -5375,10 +5526,31 @@ begin
     raise exception using errcode = 'P0001', message = 'memory_disabled';
   end if;
   if target.epoch <> p_expected_epoch then
-    raise exception using errcode = '40001', message = 'memory_epoch_conflict';
+    raise exception using errcode = 'P0001', message = 'memory_epoch_conflict';
   end if;
   if target.revision <> p_expected_revision then
-    raise exception using errcode = '40001', message = 'memory_revision_conflict';
+    raise exception using errcode = 'P0001', message = 'memory_revision_conflict';
+  end if;
+
+  -- An unchanged body is not a write: it would burn a revision and, for the
+  -- curator, look like new learning in the audit trail. The job receipt is
+  -- still stamped so a retried job is recognised above and applied once.
+  if target.content_sha256 is not distinct from p_content_sha256 then
+    if p_source_job_id is not null then
+      update public.memory_files
+      set last_source_job_id = p_source_job_id
+      where id = p_memory_file_id;
+      insert into public.memory_consolidation_results(
+        job_id, memory_file_id, scope, outcome, revision
+      ) values (
+        p_source_job_id, target.id, target.scope, 'no_change', target.revision
+      ) on conflict (job_id, memory_file_id) do update
+        set outcome = excluded.outcome,
+            revision = excluded.revision,
+            created_at = now();
+    end if;
+    return query select false, target.revision;
+    return;
   end if;
 
   update public.memory_files
@@ -5434,7 +5606,7 @@ returns table(
 )
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   target public.memory_files%rowtype;
@@ -5491,12 +5663,17 @@ declare
   target record;
   deleted_projects integer := 0;
 begin
-  -- Project moves and sharing changes take ROW EXCLUSIVE locks. Hold the
-  -- conflicting SHARE locks in parent-before-child order so a project cannot
-  -- become organization-scoped or directly shared between eligibility and
-  -- erasure.
-  lock table public.projects in share mode;
-  lock table public.project_access_grants in share mode;
+  -- Lock the caller's own private projects rather than the whole table.
+  -- FOR UPDATE on a project row blocks both a move into an organization (an
+  -- UPDATE of that row) and a new access grant (the grant's foreign key takes
+  -- KEY SHARE on the project, which FOR UPDATE excludes), so eligibility
+  -- cannot change between this check and the wipe. A table-level SHARE lock
+  -- did the same job by stalling every project write in the system for as
+  -- long as this user's files took to wipe.
+  perform project.id from public.projects project
+  where project.user_id = p_user_id and project.org_id is null
+  order by project.id
+  for update;
 
   insert into public.memory_files(scope, user_id, enabled)
   values ('user', p_user_id, true)
@@ -5546,7 +5723,7 @@ returns table(
 )
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   target public.memory_files%rowtype;
@@ -5601,7 +5778,7 @@ create or replace function public.schedule_memory_consolidation(
 returns table(job_id uuid, generation bigint)
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   state public.memory_consolidation_states%rowtype;
@@ -5622,6 +5799,7 @@ declare
   app_turn_eligible boolean;
   app_enabled boolean;
   project_enabled boolean;
+  pending_actor_ids uuid[];
 begin
   if p_surface not in ('chat', 'word', 'tabular')
     or p_turn_id is null or p_activity_id is null
@@ -5686,7 +5864,7 @@ begin
     raise exception using errcode = '22023', message = 'invalid_memory_project';
   end if;
   app_turn_eligible := public.memory_source_allows_app_memory(
-    p_surface, canonical_project_id
+    p_surface, p_conversation_id, p_actor_user_id, canonical_project_id
   );
 
   insert into public.memory_conversation_activity(
@@ -5772,6 +5950,12 @@ begin
     and current_state.conversation_id = p_conversation_id
     and current_state.actor_user_id = p_actor_user_id
   for update;
+  if not found then
+    -- The upsert above guarantees the row; a miss means it was deleted under
+    -- us. Every later statement keys on state.id, so continuing would be a
+    -- silent no-op that looks exactly like "nothing to schedule".
+    raise exception using errcode = 'P0001', message = 'memory_state_missing';
+  end if;
 
   actor_cursor_advances := state.latest_terminal_message_at is null
     or (terminal_message_at, p_turn_id) >
@@ -5829,18 +6013,28 @@ begin
     on conflict do nothing;
   end if;
 
+  -- Lock every file this turn may touch, in id order, through the unique
+  -- indexes. The obvious "user_id in (subquery) or project_id = ..." shape
+  -- cannot use either index under a top-level OR and scanned (and row
+  -- locked) the whole table on every assistant turn.
+  select coalesce(array_agg(distinct pending.actor_user_id), '{}')
+  into pending_actor_ids
+  from public.memory_consolidation_states pending
+  where pending.surface = p_surface
+    and pending.conversation_id = p_conversation_id
+    and pending.latest_turn_id is not null
+    and pending.processed_generation < pending.generation;
   perform memory_file.id
   from public.memory_files memory_file
-  where (memory_file.scope = 'user' and memory_file.user_id in (
-      select pending.actor_user_id
-      from public.memory_consolidation_states pending
-      where pending.surface = p_surface
-        and pending.conversation_id = p_conversation_id
-        and pending.latest_turn_id is not null
-        and pending.processed_generation < pending.generation
-    )) or (
-      memory_file.scope = 'project'
-      and memory_file.project_id = activity.project_id
+  where memory_file.id in (
+      select locked_user_file.id from public.memory_files locked_user_file
+      where locked_user_file.scope = 'user'
+        and locked_user_file.user_id = any(pending_actor_ids)
+      union all
+      select locked_project_file.id
+      from public.memory_files locked_project_file
+      where locked_project_file.scope = 'project'
+        and locked_project_file.project_id = activity.project_id
     )
   order by memory_file.id
   for update;
@@ -5859,7 +6053,8 @@ begin
       and memory_file.user_id = queued_state.actor_user_id;
     app_enabled := coalesce(app_file.enabled, false)
       and public.memory_source_allows_app_memory(
-        p_surface, activity.project_id
+        p_surface, p_conversation_id, queued_state.actor_user_id,
+        activity.project_id
       );
     project_enabled := false;
     if activity.project_id is not null
@@ -5941,7 +6136,7 @@ create or replace function public.set_memory_consolidation_status(
 returns boolean
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   state public.memory_consolidation_states%rowtype;
@@ -5977,7 +6172,7 @@ create or replace function public.refresh_memory_file_status(
 returns boolean
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   target public.memory_files%rowtype;
@@ -6329,6 +6524,7 @@ revoke all on public.word_chat_messages from anon, authenticated;
 revoke all on public.word_document_edits from anon, authenticated;
 revoke all on public.tabular_reviews from anon, authenticated;
 revoke all on public.tabular_review_access_grants from anon, authenticated;
+revoke all on public.tabular_review_legacy_shares from anon, authenticated;
 revoke all on public.tabular_cells from anon, authenticated;
 revoke all on public.tabular_review_rows from anon, authenticated;
 revoke all on public.tabular_review_row_sources from anon, authenticated;
@@ -6369,7 +6565,9 @@ revoke all on function public.initialize_new_user_memory()
   from public, anon, authenticated;
 revoke all on function public.lock_memory_conversation_source(text, uuid, uuid)
   from public, anon, authenticated;
-revoke all on function public.memory_source_allows_app_memory(text, uuid)
+revoke all on function public.memory_project_is_private(uuid)
+  from public, anon, authenticated;
+revoke all on function public.memory_source_allows_app_memory(text, uuid, uuid, uuid)
   from public, anon, authenticated;
 revoke all on function public.fence_memory_conversation_delete()
   from public, anon, authenticated;
@@ -6463,6 +6661,11 @@ grant execute on function public.initialize_new_user_memory()
   to service_role;
 grant execute on function public.lock_memory_conversation_source(text, uuid, uuid)
   to service_role;
+grant execute on function public.memory_project_is_private(uuid)
+  to service_role;
+grant execute
+  on function public.memory_source_allows_app_memory(text, uuid, uuid, uuid)
+  to service_role;
 grant execute on function public.fence_memory_conversation_delete()
   to service_role;
 grant execute
@@ -6529,4 +6732,447 @@ grant select, insert, update, delete
   to service_role;
 grant usage, select
   on all sequences in schema public
+  to service_role;
+
+-- Migration date: 2026-09-14
+-- Document metadata and the durable cleanup intent commit together. This also
+-- covers cascades from projects, workflows and account erasure.
+create or replace function public.queue_document_version_cleanup()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_keys text[] := array[]::text[];
+  v_cache boolean := false;
+begin
+  if tg_op = 'DELETE' then
+    v_keys := array[old.storage_path, old.pdf_storage_path];
+    v_cache := true;
+  else
+    if old.storage_path is distinct from new.storage_path then
+      v_keys := array_append(v_keys, old.storage_path);
+      v_cache := true;
+    end if;
+    if old.pdf_storage_path is distinct from new.pdf_storage_path then
+      v_keys := array_append(v_keys, old.pdf_storage_path);
+    end if;
+    if old.deleted_at is null and new.deleted_at is not null then
+      v_keys := v_keys || array[old.storage_path, old.pdf_storage_path];
+      v_cache := true;
+    end if;
+    if old.content_sha256 is distinct from new.content_sha256 then
+      v_cache := true;
+    end if;
+  end if;
+  if v_cache then
+    v_keys := array_append(v_keys, 'extracted-text/' || old.id::text || '.txt');
+  end if;
+  select coalesce(array_agg(distinct k), array[]::text[]) into v_keys
+    from unnest(v_keys) k where k is not null and k <> '';
+  if cardinality(v_keys) > 0 then
+    -- Do not dedupe different mutations of the same version: each may retire
+    -- a different source/rendition. Repeated object deletes are idempotent.
+    insert into public.db_jobs(kind, payload, max_attempts)
+    values ('document.cleanup', jsonb_build_object(
+      'versionId', old.id, 'keys', to_jsonb(v_keys)), 8);
+  end if;
+  return null;
+end;
+$$;
+revoke all on function public.queue_document_version_cleanup() from public, anon, authenticated;
+grant execute on function public.queue_document_version_cleanup() to service_role;
+drop trigger if exists document_version_cleanup on public.document_versions;
+create trigger document_version_cleanup
+after delete or update of storage_path, pdf_storage_path, deleted_at, content_sha256
+on public.document_versions for each row
+execute function public.queue_document_version_cleanup();
+
+-- Authorization remains with the calling service. These are service-role-only
+-- persistence primitives; a parent lock serializes number allocation and
+-- activation with deletion, including concurrent requests on different hosts.
+create or replace function public.create_document_version(
+  p_document_id uuid, p_version jsonb, p_activate boolean default true
+) returns jsonb
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_id uuid := coalesce((p_version->>'id')::uuid, gen_random_uuid());
+  v_row public.document_versions%rowtype;
+  v_number integer;
+begin
+  perform 1 from public.documents where id = p_document_id for update;
+  if not found then raise exception 'document_not_found' using errcode = 'P0002'; end if;
+  select * into v_row from public.document_versions where id = v_id;
+  if found then
+    if v_row.document_id <> p_document_id or v_row.deleted_at is not null then
+      raise exception 'version_identity_conflict' using errcode = '23505';
+    end if;
+    -- An upload retry must not overwrite metadata or reactivate an older
+    -- version after somebody has already created a newer one.
+    return to_jsonb(v_row);
+  end if;
+  v_number := (p_version->>'version_number')::integer;
+  if v_number is null then
+    select coalesce(max(version_number), 1) + 1 into v_number
+    from public.document_versions
+    where document_id = p_document_id
+      and source in ('upload', 'user_upload', 'assistant_edit');
+  end if;
+  insert into public.document_versions(
+    id, document_id, storage_path, pdf_storage_path, source, version_number,
+    filename, file_type, size_bytes, page_count, content_sha256
+  ) values (
+    v_id, p_document_id, p_version->>'storage_path', p_version->>'pdf_storage_path',
+    coalesce(p_version->>'source', 'upload'), v_number,
+    p_version->>'filename', p_version->>'file_type',
+    (p_version->>'size_bytes')::integer, (p_version->>'page_count')::integer,
+    p_version->>'content_sha256'
+  ) returning * into v_row;
+  if p_activate then
+    update public.documents set current_version_id = v_id, updated_at = now()
+      where id = p_document_id;
+  end if;
+  return to_jsonb(v_row);
+end;
+$$;
+revoke all on function public.create_document_version(uuid, jsonb, boolean) from public, anon, authenticated;
+grant execute on function public.create_document_version(uuid, jsonb, boolean) to service_role;
+
+create or replace function public.delete_document_version(
+  p_document_id uuid, p_version_id uuid, p_actor_id uuid
+) returns jsonb
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_current uuid;
+  v_next uuid;
+  v_deleted_at timestamptz := now();
+begin
+  select current_version_id into v_current from public.documents
+    where id = p_document_id for update;
+  if not found then return jsonb_build_object('kind', 'doc_not_found'); end if;
+  perform 1 from public.document_versions
+    where id = p_version_id and document_id = p_document_id and deleted_at is null;
+  if not found then return jsonb_build_object('kind', 'version_not_found'); end if;
+  select id into v_next from public.document_versions
+    where document_id = p_document_id and id <> p_version_id and deleted_at is null
+    order by version_number desc nulls last, created_at desc nulls last, id
+    limit 1;
+  if v_next is null then return jsonb_build_object('kind', 'only_version'); end if;
+  if v_current = p_version_id then
+    v_current := v_next;
+    update public.documents set current_version_id = v_current, updated_at = now()
+      where id = p_document_id;
+  end if;
+  update public.document_versions set storage_path = null, pdf_storage_path = null,
+    deleted_at = v_deleted_at, deleted_by = p_actor_id
+    where id = p_version_id and document_id = p_document_id;
+  return jsonb_build_object('deleted_version_id', p_version_id,
+    'current_version_id', v_current, 'deleted_at', v_deleted_at);
+end;
+$$;
+revoke all on function public.delete_document_version(uuid, uuid, uuid) from public, anon, authenticated;
+grant execute on function public.delete_document_version(uuid, uuid, uuid) to service_role;
+
+create or replace function public.create_document_versions(p_versions jsonb)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  item jsonb;
+  result jsonb := '[]'::jsonb;
+begin
+  if jsonb_typeof(p_versions) <> 'array' or jsonb_array_length(p_versions) > 500 then
+    raise exception 'invalid_version_batch' using errcode = '22023';
+  end if;
+  -- Consistent lock order prevents overlapping batches from deadlocking.
+  perform 1 from public.documents
+    where id in (select (value->>'document_id')::uuid from jsonb_array_elements(p_versions))
+    order by id for update;
+  for item in select value from jsonb_array_elements(p_versions) loop
+    result := result || jsonb_build_array(public.create_document_version(
+      (item->>'document_id')::uuid, item - 'document_id', true));
+  end loop;
+  return result;
+end;
+$$;
+revoke all on function public.create_document_versions(jsonb) from public, anon, authenticated;
+grant execute on function public.create_document_versions(jsonb) to service_role;
+
+create or replace function public.activate_document_version(p_document_id uuid, p_version_id uuid)
+returns boolean language plpgsql security definer set search_path = '' as $$
+begin
+  perform 1 from public.documents where id = p_document_id for update;
+  if not found then return false; end if;
+  perform 1 from public.document_versions
+    where id = p_version_id and document_id = p_document_id and deleted_at is null;
+  if not found then return false; end if;
+  update public.documents set current_version_id = p_version_id, updated_at = now()
+    where id = p_document_id;
+  return true;
+end;
+$$;
+revoke all on function public.activate_document_version(uuid, uuid) from public, anon, authenticated;
+grant execute on function public.activate_document_version(uuid, uuid) to service_role;
+
+
+-- Kind-scoped claim scan: the document.cleanup handler coalesces its pending
+-- siblings into one pass instead of draining them a poll batch at a time.
+create index if not exists db_jobs_pending_kind_idx
+  on public.db_jobs (kind, run_at)
+  where status = 'pending';
+
+-- Cleanup intents survive stale claims and old workers rejecting a new kind
+-- during migration-before-code rollout. Both poll and Redis claim paths revive
+-- failed cleanup rows; ordinary jobs retain their finite attempt budgets.
+-- Revival is gated on run_at and pushes run_at forward on every claim, so a
+-- runner that cannot execute the kind backs off instead of hot-looping.
+--
+-- The 2-argument signature is dropped rather than overloaded: Postgres cannot
+-- resolve claim_db_jobs(5, 600) when both a 2-arg and a 3-arg (defaulted)
+-- candidate exist.
+drop function if exists public.claim_db_jobs(integer, integer);
+create or replace function public.claim_db_jobs(
+  p_limit integer default 5,
+  p_stale_seconds integer default 600,
+  p_kind text default null
+)
+returns setof public.db_jobs
+language sql set search_path = ''
+as $$
+  with abandoned as (
+    update public.db_jobs
+       set status = 'failed',
+           finished_at = now(),
+           last_error = coalesce(
+             last_error,
+             'abandoned: worker died mid-run and attempts are exhausted'
+           )
+     where status = 'running'
+       and claimed_at < now() - make_interval(secs => p_stale_seconds)
+       and attempts >= max_attempts
+       and kind not in ('storage.cleanup', 'document.cleanup')
+    returning id
+  ), candidates as (
+    select id
+      from public.db_jobs
+     where (p_kind is null or kind = p_kind)
+       and ((status = 'pending' and run_at <= now())
+        -- Cleanup intents are retried forever, but politely: a revived
+        -- `failed` row waits for its own run_at like everything else.
+        or (status = 'failed'
+            and kind in ('storage.cleanup', 'document.cleanup')
+            and run_at <= now())
+        or (status = 'running'
+            and claimed_at < now() - make_interval(secs => p_stale_seconds)
+            and (
+              attempts < max_attempts
+              or kind in ('storage.cleanup', 'document.cleanup')
+            )))
+     order by run_at
+     limit p_limit
+       for update skip locked
+  )
+  update public.db_jobs j
+     set status = 'running',
+         claimed_at = now(),
+         finished_at = null,
+         attempts = case
+           when j.kind in ('storage.cleanup', 'document.cleanup')
+             then least(j.attempts::bigint + 1, 2147483647)::integer
+           else j.attempts + 1
+         end,
+         max_attempts = case
+           when j.kind in ('storage.cleanup', 'document.cleanup')
+             then 2147483647
+           else j.max_attempts
+         end,
+         -- Back the revived row off before running it, so a claimant that
+         -- fails the row back to `failed` (an old runner rejecting an unknown
+         -- kind) cannot re-enter this branch on the next tick.
+         run_at = case
+           when j.status = 'failed'
+             and j.kind in ('storage.cleanup', 'document.cleanup')
+             then now() + least(
+               interval '10 minutes',
+               make_interval(secs => 30 * least(j.attempts::bigint + 1, 20))
+             )
+           else j.run_at
+         end,
+         dedupe_key = case
+           when j.status = 'failed'
+             and j.kind in ('storage.cleanup', 'document.cleanup')
+             then null
+           else j.dedupe_key
+         end
+    from candidates c
+   where j.id = c.id
+  returning j.*;
+$$;
+revoke all on function public.claim_db_jobs(integer, integer, text)
+  from public, anon, authenticated;
+grant execute on function public.claim_db_jobs(integer, integer, text)
+  to service_role;
+
+-- Claim ONE job by id — the Redis-delivery path (transactional-outbox
+-- pattern). When Redis is configured, enqueue also adds a BullMQ "delivery"
+-- job carrying this row's id so pickup is instant; the worker still claims
+-- through Postgres via this function, so a duplicate delivery (BullMQ retry,
+-- poller backstop racing the delivery) can never double-run the job: the
+-- second claimer matches zero rows. Same stale-running recovery as the batch
+-- claim, including its attempt budget: a job that kills its worker must not be
+-- redelivered forever. Terminally failing a spent stale row is left to the
+-- batch claim above, which every deployment runs (as the delivery mechanism
+-- without Redis, as the lost-delivery backstop with it).
+create or replace function public.claim_db_job(
+  p_id uuid,
+  p_stale_seconds integer default 600
+)
+returns setof public.db_jobs
+language sql set search_path = ''
+as $$
+  update public.db_jobs j
+     set status = 'running',
+         claimed_at = now(),
+         finished_at = null,
+         attempts = case
+           when j.kind in ('storage.cleanup', 'document.cleanup')
+             then least(j.attempts::bigint + 1, 2147483647)::integer
+           else j.attempts + 1
+         end,
+         max_attempts = case
+           when j.kind in ('storage.cleanup', 'document.cleanup')
+             then 2147483647
+           else j.max_attempts
+         end,
+         run_at = case
+           when j.status = 'failed'
+             and j.kind in ('storage.cleanup', 'document.cleanup')
+             then now() + least(
+               interval '10 minutes',
+               make_interval(secs => 30 * least(j.attempts::bigint + 1, 20))
+             )
+           else j.run_at
+         end,
+         dedupe_key = case
+           when j.status = 'failed'
+             and j.kind in ('storage.cleanup', 'document.cleanup')
+             then null
+           else j.dedupe_key
+         end
+   where j.id = p_id
+     and ((j.status = 'pending' and j.run_at <= now())
+       or (j.status = 'failed'
+           and j.kind in ('storage.cleanup', 'document.cleanup')
+           and j.run_at <= now())
+       or (j.status = 'running'
+           and j.claimed_at < now() - make_interval(secs => p_stale_seconds)
+           and (
+             j.attempts < j.max_attempts
+             or j.kind in ('storage.cleanup', 'document.cleanup')
+           )))
+  returning j.*;
+$$;
+revoke all on function public.claim_db_job(uuid, integer)
+  from public, anon, authenticated;
+grant execute on function public.claim_db_job(uuid, integer)
+  to service_role;
+
+drop index if exists public.db_jobs_failed_cleanup_run_at_idx;
+create index db_jobs_failed_cleanup_run_at_idx
+  on public.db_jobs(run_at)
+  where status = 'failed'
+    and kind in ('storage.cleanup', 'document.cleanup');
+
+-- Rollout probe. Returns 1 only when every lifecycle RPC the documents module
+-- calls exists; 0 when the document-lifecycle migration has not been applied.
+-- A missing function makes the RPC itself unresolvable (PostgREST PGRST202),
+-- which the backend treats the same way — see lib/dbq/lifecycleGuard.ts.
+create or replace function public.document_lifecycle_version()
+returns integer
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select case
+    -- 20260914_01: the five lifecycle RPCs. Without them every upload,
+    -- version and edit fails and deletes orphan their objects.
+    when (
+      select count(distinct p.proname)
+        from pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'public'
+         and p.proname in (
+           'create_document_version',
+           'create_document_versions',
+           'activate_document_version',
+           'delete_document_version',
+           'queue_document_version_cleanup'
+         )
+    ) <> 5 then 0
+    -- 20260916_01: the upload retry marker. Code that stamps it against a
+    -- database without the column fails every new-document upload, so the
+    -- guard has to count it as part of the contract.
+    when not exists (
+      select 1
+        from pg_catalog.pg_attribute a
+        join pg_catalog.pg_class c on c.oid = a.attrelid
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = 'public'
+         and c.relname = 'upload_session_files'
+         and a.attname = 'document_created_at'
+         and a.attnum > 0
+         and not a.attisdropped
+    ) then 1
+    else 2
+  end;
+$$;
+revoke all on function public.document_lifecycle_version()
+  from public, anon, authenticated;
+grant execute on function public.document_lifecycle_version() to service_role;
+
+-- Reference checks for the cleanup worker, as RPCs so the key list travels in
+-- the POST body. The previous `in(...)` filters put up to 500 storage paths in
+-- the request URL; the deployment gateway answered 414 (Request-URI Too
+-- Large) at about 100 ordinary paths, so a coalesced cleanup run failed
+-- before deleting anything and every retry rebuilt the same oversized batch.
+create or replace function public.document_cleanup_referenced_keys(p_keys text[])
+returns table(key text)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select v.storage_path
+    from public.document_versions v
+   where v.deleted_at is null
+     and v.storage_path = any(p_keys)
+  union
+  select v.pdf_storage_path
+    from public.document_versions v
+   where v.deleted_at is null
+     and v.pdf_storage_path = any(p_keys);
+$$;
+revoke all on function public.document_cleanup_referenced_keys(text[])
+  from public, anon, authenticated;
+grant execute on function public.document_cleanup_referenced_keys(text[])
+  to service_role;
+
+create or replace function public.document_cache_writer_active(p_version_ids text[])
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+      from public.db_jobs j
+     where j.kind = 'document.precompute_text'
+       and j.status = 'running'
+       and (j.payload->>'versionId') = any(p_version_ids)
+  );
+$$;
+revoke all on function public.document_cache_writer_active(text[])
+  from public, anon, authenticated;
+grant execute on function public.document_cache_writer_active(text[])
   to service_role;

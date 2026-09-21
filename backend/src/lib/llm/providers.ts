@@ -5,6 +5,7 @@ import {
   type AiSdkAdapterConfig,
 } from "./aiSdk";
 import { completeClaudeCode, streamClaudeCode } from "./claudeCode";
+import { localModelToleranceMiddleware } from "./localModelMiddleware";
 import {
   isOpenCodeGoChatCompletionsModel,
   isOpenCodeGoMessagesModel,
@@ -14,7 +15,13 @@ import {
   providerForModel,
   vercelModelId,
 } from "./models";
+import {
+  apiKeyForConfiguredModel,
+  getConfiguredModel,
+  tolerateTextToolCalls,
+} from "./registry";
 import type {
+  ConfiguredModel,
   Provider,
   ReasoningLevel,
   StreamChatParams,
@@ -57,13 +64,27 @@ const ROUTER_KEY_ENV_HINTS: Record<RouterProvider, string> = {
   "opencode-go": "OPENCODE_API_KEY",
 };
 
+// Env aliases a provider also answers to. CLAUDE_API_KEY is accepted by
+// envApiKey("claude") in modules/user/user.apiKeyStore.ts, which decides
+// whether Settings reports the key as configured — without the same alias here
+// a deployment that only sets CLAUDE_API_KEY showed a green key and then
+// failed every request with "not configured".
+const ENVIRONMENT_KEY_ALIASES: Record<string, string[]> = {
+  ANTHROPIC_API_KEY: ["CLAUDE_API_KEY"],
+};
+
 function requiredKey(
   label: string,
   environmentVariable: string,
   override?: string | null,
 ): string {
   const key =
-    override?.trim() || process.env[environmentVariable]?.trim() || "";
+    override?.trim() ||
+    process.env[environmentVariable]?.trim() ||
+    (ENVIRONMENT_KEY_ALIASES[environmentVariable] ?? [])
+      .map((alias) => process.env[alias]?.trim())
+      .find((value) => !!value) ||
+    "";
   if (!key) {
     throw new Error(
       `${label} API key is not configured. Set ${environmentVariable} or add a user ${label} key.`,
@@ -186,6 +207,59 @@ async function createRouterAdapter(
   };
 }
 
+function configuredModelOrThrow(id: string): ConfiguredModel {
+  const configured = getConfiguredModel(id);
+  if (!configured) {
+    throw new Error(
+      `Model ${id} is not declared in MIKE_MODEL_CONFIG_JSON.`,
+    );
+  }
+  if (!configured.baseUrl?.trim()) {
+    throw new Error(`Configured model ${id} is missing a baseUrl.`);
+  }
+  return configured;
+}
+
+async function createConfiguredAdapter(
+  id: string,
+  apiKeys?: UserApiKeys,
+): Promise<AiSdkAdapterConfig> {
+  const configured = configuredModelOrThrow(id);
+  const { createOpenAICompatible } = await import("@ai-sdk/openai-compatible");
+  const apiKey = apiKeyForConfiguredModel(configured, apiKeys);
+  const client = createOpenAICompatible({
+    name: configured.id,
+    baseURL: configured.baseUrl,
+    // Omit Authorization entirely for endpoints declared without auth.
+    ...(apiKey ? { apiKey } : {}),
+    ...(configured.maxTokensField === "max_completion_tokens"
+      ? {
+          transformRequestBody: (body: Record<string, unknown>) => {
+            const { max_tokens: maxTokens, ...rest } = body;
+            return maxTokens === undefined
+              ? rest
+              : { ...rest, max_completion_tokens: maxTokens };
+          },
+        }
+      : {}),
+    fetch: aiSdkFetch,
+  });
+  const base = client(configured.apiModel ?? configured.id);
+  const { wrapLanguageModel } = await import("ai");
+  return {
+    provider: "openai-compatible",
+    label: configured.label || configured.id,
+    model: tolerateTextToolCalls(configured)
+      ? wrapLanguageModel({
+          model: base,
+          middleware: localModelToleranceMiddleware(),
+        })
+      : base,
+    modelId: configured.id,
+    supportsReasoning: false,
+  };
+}
+
 function unsupportedOpenCodeGoModel(model: string): Error {
   return new Error(
     `OpenCode Go model ${openCodeGoModelId(model)} requires a protocol Mike does not support yet. Select a model listed in Settings → Bring Your Own Keys → Routers.`,
@@ -268,6 +342,10 @@ async function createProviderAdapter(
       });
     }
     return createRouterAdapter(provider, model, apiKeys);
+  }
+
+  if (provider === "openai-compatible") {
+    return createConfiguredAdapter(model, apiKeys);
   }
 
   const { createOpenAICompatible } = await import("@ai-sdk/openai-compatible");

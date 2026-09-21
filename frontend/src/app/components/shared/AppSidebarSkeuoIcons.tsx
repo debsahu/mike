@@ -6,7 +6,7 @@ type IconProps = Omit<
 >;
 
 const ICON_BASE_PATH = "/icons";
-const ICON_VERSION = "41";
+const ICON_VERSION = "44";
 
 function AppSidebarIcon({
   name,
@@ -28,8 +28,24 @@ function AppSidebarIcon({
   );
 }
 
-export function ChatSkeuoIcon(props: IconProps) {
-  return <AppSidebarIcon name="features/chat" {...props} />;
+export function ChatSkeuoIcon({
+  className,
+  tone = "blue",
+  ...props
+}: IconProps & { tone?: "blue" | "green" }) {
+  return (
+    <AppSidebarIcon
+      name="features/chat"
+      className={[className, tone === "green" ? "hue-rotate-[285deg]" : ""]
+        .filter(Boolean)
+        .join(" ")}
+      {...props}
+    />
+  );
+}
+
+export function IdeSkeuoIcon(props: IconProps) {
+  return <AppSidebarIcon name="features/ide" {...props} />;
 }
 
 export function FolderSkeuoIcon(props: IconProps) {

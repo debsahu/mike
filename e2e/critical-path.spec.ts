@@ -6,43 +6,9 @@
  *
  * Prerequisite: auth.setup.ts has already saved the session to e2e/.auth/user.json
  */
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
 import { hasLlmKey, LLM_SKIP_REASON } from "./llm";
-import path from "path";
-
-const PDF_FIXTURE = path.join(__dirname, "fixtures/test.pdf");
-
-/**
- * Select a Claude model in the chat input's ModelToggle.
- *
- * This spec runs only when ANTHROPIC_API_KEY is set in the Playwright
- * environment (test.skip(!hasLlmKey, ...) — e2e/llm.ts). The CI stack exports
- * the same secret to the backend, whose key resolution (userApiKeys.ts
- * envApiKey()) falls back to the ANTHROPIC_API_KEY env var, so the "claude"
- * provider reports as configured and ModelToggle shows the Anthropic models as
- * available. The default model (Gemini) has no key configured in CI, so a
- * submit with it would be blocked by the ApiKeyMissingModal. We pick
- * "Claude Sonnet 4.6" (the cheapest Anthropic entry in ModelToggle.MODELS) so
- * the request streams a real response. The Radix DropdownMenu trigger's title
- * is "Choose model" (current model available) or "API key missing for selected
- * model" (default-Gemini case).
- */
-const CLAUDE_MODEL_LABEL = "Claude Sonnet 4.6";
-
-async function selectClaudeModel(page: Page) {
-    const trigger = page
-        .locator(
-            'button[title="Choose model"], button[title="API key missing for selected model"]',
-        )
-        .first();
-    await expect(trigger).toBeVisible({ timeout: 10_000 });
-    await trigger.click();
-    await page.getByRole("menuitem", { name: CLAUDE_MODEL_LABEL }).click();
-    // After selection the trigger label reflects the chosen model.
-    await expect(
-        page.getByRole("button", { name: CLAUDE_MODEL_LABEL }),
-    ).toBeVisible({ timeout: 5_000 });
-}
+import { PDF_FIXTURE, selectClaudeModel } from "./helpers";
 
 /* ─── Test 1: authenticated landing ─────────────────────────────────────── */
 
@@ -65,49 +31,16 @@ test("create project, upload PDF, ask a question and receive a response", async 
        so set it here. */
     test.setTimeout(120_000);
 
-    /* ── Step 1: navigate to projects ─────────────────────────────────────── */
-    await page.goto("/projects");
-    await expect(page).toHaveURL(/\/projects/);
-
-    /* ── Step 2: open the "New project" modal ────────────────────────────── */
-    /* The Plus icon button in the header has aria-label="New project" */
-    const createBtn = page.getByRole("button", { name: "New project" });
-    await expect(createBtn).toBeVisible({ timeout: 10_000 });
-    await createBtn.click();
-
-    /* ── Step 3: fill in the project name ─────────────────────────────────── */
-    const nameInput = page.getByPlaceholder("Project name");
-    await expect(nameInput).toBeVisible({ timeout: 5_000 });
-
+    /* ── Steps 1-5: create a project with the PDF attached ────────────────── */
+    /* The wizard (Details → Access → Add Documents) is driven from one shared
+       helper, e2e/helpers.ts, so a new step cannot be added to the modal
+       without this spec picking it up. This spec used to walk the modal
+       itself, clicking a single "Next" and then a `button[type="submit"]`;
+       the Access step stranded it on step two and the final primary is a
+       type="button", so both halves were wrong. */
     const projectName = `E2E Test Project ${Date.now()}`;
-    await nameInput.fill(projectName);
-
-    /* ── Step 4: advance to "Add Documents" and upload a PDF ──────────────── */
-    /* NewProjectModal is a two-step wizard; the details step's primary action is
-       a plain "Next" and only the documents step carries the file input. */
-    await page.getByRole("button", { name: "Next", exact: true }).click();
-
-    const uploadBtn = page.getByRole("button", { name: /^Upload/ });
-    /* We need to trigger the hidden file input; intercept the chooser */
-    const fileChooserPromise = page.waitForEvent("filechooser");
-    await uploadBtn.click();
-    const fileChooser = await fileChooserPromise;
-    await fileChooser.setFiles(PDF_FIXTURE);
-
-    /* The button label should update to reflect the queued file */
-    await expect(
-        page.getByRole("button", { name: /^Upload \(1\)/ }),
-    ).toBeVisible({ timeout: 5_000 });
-
-    /* ── Step 5: submit the form ──────────────────────────────────────────── */
-    /* The PDF upload runs inside NewProjectModal.handleSubmit
-       (await Promise.all([uploadProjectDocument(...)])) BEFORE onCreated fires,
-       so the "Creating…" button state can persist for many seconds while the
-       file uploads. ProjectsOverview.onCreated then router.push()es to the new
-       project page, so wait for that navigation (generously, to cover the
-       upload). */
-    await page.click('button[type="submit"]');
-    await page.waitForURL(/\/projects\/[^/]+$/, { timeout: 30_000 });
+    await createProject(page, projectName, PDF_FIXTURE);
+    await expect(page).toHaveURL(/\/projects\/[^/]+$/);
 
     /* ── Step 6: open the project assistant ───────────────────────────────── */
     /* We're already on /projects/[id] (Documents tab by default). The project
@@ -126,11 +59,16 @@ test("create project, upload PDF, ask a question and receive a response", async 
     await createNew.click();
     /* Navigates to /projects/{id}/assistant (new chat UI) */
     await page.waitForURL(/\/projects\/.+\/assistant/, { timeout: 10_000 });
-    await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
 
     /* ── Step 7: select a Claude model, type a question, submit ───────────── */
+    /* Wait on the chat input itself, not on "networkidle". A swallowed
+       `waitForLoadState("networkidle", …).catch(() => {})` used to stand here:
+       it proved nothing (its failure was discarded) and networkidle is an
+       unreliable signal on a page that holds a streaming connection open. The
+       input is what the next lines type into, so waiting for it is both the
+       real precondition and an honest failure. */
     const chatInput = page.getByPlaceholder("How can I help?");
-    await expect(chatInput).toBeVisible({ timeout: 10_000 });
+    await expect(chatInput).toBeVisible({ timeout: 20_000 });
 
     /* The default Gemini model has no key configured, so submitting it would be
        blocked by the ApiKeyMissingModal. Select a Claude model (backed by the

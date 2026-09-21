@@ -4,6 +4,7 @@ import React, {
     createContext,
     useContext,
     useEffect,
+    useMemo,
     useState,
     ReactNode,
     useCallback,
@@ -33,6 +34,10 @@ import {
 import type { Message } from "@/app/components/shared/types";
 import { applyDarkMode } from "@/app/lib/theme";
 import { publishTabularChatSettingsUpdate } from "@/app/lib/tabularChatSettingsEvents";
+import {
+    clearConfiguredModels,
+    refreshConfiguredModels,
+} from "@/app/hooks/useConfiguredModels";
 
 interface UserProfile {
     displayName: string | null;
@@ -249,9 +254,11 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
         if (isAuthenticated && userId) {
             setLoading(true);
             loadProfile();
+            void refreshConfiguredModels();
         } else {
             setProfile(null);
             setLoading(false);
+            clearConfiguredModels();
         }
     }, [isAuthenticated, userId, loadProfile]);
 
@@ -599,6 +606,7 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
                           }
                         : null,
                 );
+                void refreshConfiguredModels();
                 return true;
             } catch (error) {
                 if (isMfaRequiredError(error)) throw error;
@@ -627,33 +635,61 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
         return false;
     }, [user, profile]);
 
+    // A fresh object here re-renders every consumer of this context on every
+    // provider render, profile change or not.
+    const value = useMemo<UserProfileContextType>(
+        () => ({
+            profile,
+            loading,
+            apiKeysDegraded,
+            updateDisplayName,
+            updateOrganisation,
+            completeOnboarding,
+            updatePersonalisation,
+            syncPasswordSet,
+            updateModelPreference,
+            persistChatModelSelection,
+            persistChatReasoningSelection,
+            updateMfaOnLogin,
+            updateLegalResearchUs,
+            updateQuickActionsVisible,
+            updateOpenRouterModels,
+            updateVercelModels,
+            updateOpenCodeGoModels,
+            updateDarkMode,
+            updateProjectMemoryDefault,
+            updateApiKey,
+            reloadProfile,
+            incrementMessageCredits,
+        }),
+        [
+            profile,
+            loading,
+            apiKeysDegraded,
+            updateDisplayName,
+            updateOrganisation,
+            completeOnboarding,
+            updatePersonalisation,
+            syncPasswordSet,
+            updateModelPreference,
+            persistChatModelSelection,
+            persistChatReasoningSelection,
+            updateMfaOnLogin,
+            updateLegalResearchUs,
+            updateQuickActionsVisible,
+            updateOpenRouterModels,
+            updateVercelModels,
+            updateOpenCodeGoModels,
+            updateDarkMode,
+            updateProjectMemoryDefault,
+            updateApiKey,
+            reloadProfile,
+            incrementMessageCredits,
+        ],
+    );
+
     return (
-        <UserProfileContext.Provider
-            value={{
-                profile,
-                loading,
-                apiKeysDegraded,
-                updateDisplayName,
-                updateOrganisation,
-                completeOnboarding,
-                updatePersonalisation,
-                syncPasswordSet,
-                updateModelPreference,
-                persistChatModelSelection,
-                persistChatReasoningSelection,
-                updateMfaOnLogin,
-                updateLegalResearchUs,
-                updateQuickActionsVisible,
-                updateOpenRouterModels,
-                updateVercelModels,
-                updateOpenCodeGoModels,
-                updateDarkMode,
-                updateProjectMemoryDefault,
-                updateApiKey,
-                reloadProfile,
-                incrementMessageCredits,
-            }}
-        >
+        <UserProfileContext.Provider value={value}>
             {children}
         </UserProfileContext.Provider>
     );

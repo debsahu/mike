@@ -1,14 +1,16 @@
 "use client";
 
-import { useCallback, useState, useRef, useEffect } from "react";
+import { useCallback, useMemo, useState, useRef, useEffect } from "react";
 import { createPortal, flushSync } from "react-dom";
 import { useRouter } from "next/navigation";
 import { ArrowDown, Pencil, Plus, Trash2, Users } from "lucide-react";
 import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
 import { ChatInput } from "./ChatInput";
+import { InitialView } from "./InitialView";
+import { resolveDocumentViewType } from "@/app/lib/documentViewType";
 import type { ChatInputHandle } from "./ChatInput";
-import { AskInputPopup } from "./AskInputPopup";
+import { ChatInputPrompt } from "./ChatInputPrompt";
 import {
     AssistantSidePanel,
     assistantSidePanelTabId,
@@ -24,6 +26,7 @@ import type {
     Chat,
     Citation,
     EditAnnotation,
+    Document,
     Message,
 } from "../shared/types";
 import {
@@ -35,12 +38,17 @@ import { useSidebar } from "@/app/contexts/SidebarContext";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
 import { usePageChrome } from "@/app/contexts/PageChromeContext";
 import { invalidateDocxBytes } from "@/app/hooks/useFetchDocxBytes";
-import { resolvePanelDocumentVersion } from "./panelDocumentVersion";
+import { resolvePanelDocumentVersionResult } from "./panelDocumentVersion";
 import { LIQUID_GLASS_TRANSLUCENT_ACTION_CLASS } from "@/app/components/ui/liquid-surface";
 import { HeaderButtonUI, HeaderButtonsUI } from "@/shared/ui/HeaderButtonsUI";
 import { HeaderActionsMenu } from "@/app/components/shared/HeaderActionsMenu";
 import { PermissionDeniedPopup } from "@/app/components/popups/PermissionDeniedPopup";
 import { WarningPopup } from "@/app/components/popups/WarningPopup";
+import { ApiKeyMissingPopup } from "@/app/components/popups/ApiKeyMissingPopup";
+import {
+    getModelProvider,
+    providerLabel,
+} from "@/app/lib/modelAvailability";
 import { can, roleFrom } from "@/app/lib/permissions";
 import { userFacingApiError } from "@/app/lib/userFacingError";
 
@@ -61,13 +69,49 @@ interface Props {
             >;
         },
     ) => Promise<string | null>;
+    /** Stop control: aborts the turn in flight. */
     cancel: () => void;
+    /**
+     * Set when a provider rejected the caller's API key on the last send.
+     * Surfaces the fix-your-key popup; retrying is pointless until it changes.
+     * `model` may be null (an ask-inputs response carries none), which only
+     * costs the provider's name in the message.
+     */
+    rejectedApiKey?: { model: string | null } | null;
+    onDismissInvalidApiKey?: () => void;
+    /**
+     * Leave the turn in flight running (New chat). The server persists the
+     * finished answer; only `cancel` may cut it short.
+     */
+    detach: () => void;
     /**
      * Whether the caller may write in this chat. The server serves the
      * standing on GET /chat/:id; surfaces that know it must pass it, so a
      * read-only caller gets the disabled composer instead of a 403 on send.
+     *
+     * `null` is the third answer: not known yet. It closes the composer like
+     * `false` does, but says nothing about the caller's access, so the page
+     * does not accuse an owner of being a viewer for the length of a fetch.
      */
-    canSend?: boolean;
+    canSend?: boolean | null;
+    /**
+     * Whether `canSend` is known yet. While the served standing is still in
+     * flight, access is unknown — neither a licence nor a refusal — so the
+     * composer is not rendered at all rather than flashing the read-only
+     * placeholder at a caller who does have edit access. Surfaces that know
+     * the standing at mount leave this alone.
+     */
+    accessResolved?: boolean;
+    /**
+     * Whether this chat's history is still loading. Separate from `canSend`
+     * so the composer can say which of the two is closing it: once the
+     * standing is resolved the composer stays on the page, and a thread switch
+     * reads "still arriving" (while an answer streams into the thread) or
+     * "loading", not "needs edit access".
+     */
+    chatLoading?: boolean;
+    /** Shares document previews with the initial composer before a chat exists. */
+    onInitialSubmit?: (message: Message) => void;
 }
 
 const ASSISTANT_PANEL_TRANSITION_MS = 500;
@@ -95,9 +139,23 @@ export function ChatView({
     isResponseLoading,
     handleChat,
     cancel,
+    rejectedApiKey = null,
+    onDismissInvalidApiKey,
+    detach,
     canSend,
+    accessResolved = true,
+    chatLoading,
+    onInitialSubmit,
 }: Props) {
     const router = useRouter();
+    // The model is what we asked for, so it identifies whose key was rejected.
+    const rejectedKeyProvider = useMemo(
+        () =>
+            rejectedApiKey?.model
+                ? getModelProvider(rejectedApiKey.model)
+                : null,
+        [rejectedApiKey],
+    );
     const [tabs, setTabs] = useState<AssistantSidePanelTab[]>([]);
     const [activeTabId, setActiveTabId] = useState<string | null>(null);
     const [panelMounted, setPanelMounted] = useState(false);
@@ -107,6 +165,11 @@ export function ChatView({
     const [actionGate, setActionGate] = useState<{
         action: string;
         requiredRole: "owner" | "editor";
+        /** Overrides the role-derived heading/body for refusals that are
+         *  not about the caller's role on THIS chat — the shared-chat
+         *  citation case, where the documents were simply not shared. */
+        title?: string;
+        message?: string;
     } | null>(null);
     const [actionError, setActionError] = useState<{
         title: string;
@@ -115,9 +178,6 @@ export function ChatView({
     const [workflowModalInitialId, setWorkflowModalInitialId] = useState<
         string | undefined
     >();
-    const [hiddenAskInputKeys, setHiddenAskInputKeys] = useState<Set<string>>(
-        () => new Set(),
-    );
     const [reloadingDocIds, setReloadingDocIds] = useState<Set<string>>(
         () => new Set(),
     );
@@ -145,11 +205,6 @@ export function ChatView({
     const activeTab = tabs.find((tab) => tab.id === activeTabId);
     const activeCitation =
         activeTab?.kind === "citation" ? activeTab.citation : null;
-
-    useEffect(() => {
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- reset per-chat UI state when switching chats
-        setHiddenAskInputKeys(new Set());
-    }, [chatId]);
 
     const showPanel = useCallback(() => {
         if (panelCloseTimerRef.current !== null) {
@@ -277,16 +332,68 @@ export function ChatView({
     );
 
     /**
+     * Say why a document behind this chat would not open.
+     *
+     * A chat can be shared without its documents, and that is the common case
+     * for a standalone chat: the recipient's version lookup answers 403/404.
+     * Silently returning made every citation pill a dead control with no hint
+     * why. But 404 has a second reading, and the sharing sentence is a lie in
+     * it: the chat's OWNER sees the same status when the document they cited
+     * has since been deleted, and telling them somebody withheld their own
+     * file explains nothing and points at nobody. Role decides which of the
+     * two the reader is looking at.
+     *
+     * Only for a STANDALONE chat, though. In a project chat `activeChatRole`
+     * is the role on the PROJECT, so every editor and viewer there was told
+     * "the person who shared this chat has not shared its documents" about a
+     * project document they can see perfectly well and that had simply been
+     * deleted. Nobody shared that chat with them; they are in the project.
+     * A project chat keeps the generic notice.
+     *
+     * Everything else — network, 5xx, a document with no versions at all —
+     * is not about access and gets the plain failure notice rather than a
+     * permission popup.
+     */
+    const reportUnresolvedDocument = useCallback(
+        (status: "denied" | "unavailable") => {
+            const sharedStandaloneChat =
+                !activeChat?.project_id && activeChatRole !== "owner";
+            if (status === "denied" && sharedStandaloneChat) {
+                setActionGate({
+                    action: "open this document",
+                    requiredRole: "editor",
+                    title: "Document not shared",
+                    message:
+                        "The person who shared this chat has not shared its documents.",
+                });
+                return;
+            }
+            setActionError({
+                title: "Document unavailable",
+                message:
+                    status === "denied"
+                        ? "This document is no longer available."
+                        : "This document could not be opened. Please try again.",
+            });
+        },
+        [activeChat?.project_id, activeChatRole],
+    );
+
+    /**
      * Open a tab showing a single citation quote. Called from
      * AssistantMessage when the user clicks a numbered citation pill.
      */
     const openCitation = useCallback(
         async (citation: Citation, options?: { showQuotes?: boolean }) => {
             const showQuotes = options?.showQuotes ?? true;
-            const document = await resolvePanelDocumentVersion(
+            const resolution = await resolvePanelDocumentVersionResult(
                 panelDocumentFromCitation(citation, showQuotes),
             );
-            if (!document) return;
+            if (resolution.status !== "resolved") {
+                reportUnresolvedDocument(resolution.status);
+                return;
+            }
+            const document = resolution.document;
             if (!showQuotes) {
                 upsertTab({
                     kind: "document",
@@ -302,7 +409,7 @@ export function ChatView({
                 citation,
             });
         },
-        [upsertTab],
+        [reportUnresolvedDocument, upsertTab],
     );
 
     const openCase = useCallback(
@@ -354,24 +461,51 @@ export function ChatView({
             filename: string;
             versionId: string | null;
             versionNumber: number | null;
+            fileType?: string | null;
         }) => {
-            const document = await resolvePanelDocumentVersion({
+            // The download card's click is the same question the citation
+            // pill asks, and it was answered with a bare `return`: a card
+            // whose document was deleted, or never shared, did nothing at all
+            // when clicked. Same resolution, same words.
+            const resolution = await resolvePanelDocumentVersionResult({
                 document_id: args.documentId,
                 title: args.filename,
-                type: panelDocumentType(args.filename),
+                type: args.fileType
+                    ? resolveDocumentViewType({
+                          filename: args.filename,
+                          fileType: args.fileType,
+                      })
+                    : panelDocumentType(args.filename),
                 metadata: [],
                 quotes: [],
                 version_id: args.versionId,
                 version_number: args.versionNumber,
             });
-            if (!document) return;
+            if (resolution.status !== "resolved") {
+                reportUnresolvedDocument(resolution.status);
+                return;
+            }
+            const document = resolution.document;
             upsertTab({
                 kind: "document",
                 id: assistantSidePanelTabId(document),
                 document,
             });
         },
-        [upsertTab],
+        [reportUnresolvedDocument, upsertTab],
+    );
+
+    const handleAttachedDocumentClick = useCallback(
+        (document: Document) => {
+            void openDocument({
+                documentId: document.id,
+                filename: document.filename,
+                versionId: document.current_version_id ?? null,
+                versionNumber: document.active_version_number ?? null,
+                fileType: document.file_type,
+            });
+        },
+        [openDocument],
     );
 
     const [resolvedEditStatuses, setResolvedEditStatuses] = useState<
@@ -506,6 +640,30 @@ export function ChatView({
         [patchTab],
     );
 
+    /**
+     * Dismisses a tab's citation quote or tracked change, leaving the document
+     * open. This drops the tab to a plain document view rather than hiding the
+     * section inside the panel: reopening the same citation upserts an
+     * identical tab, which by design produces no prop change, so a panel-local
+     * dismissal would leave the user unable to get the quote back.
+     */
+    const handleCloseAnnotation = useCallback((tabId: string) => {
+        setTabs((prev) => {
+            const index = prev.findIndex((tab) => tab.id === tabId);
+            if (index < 0 || prev[index].kind === "document") return prev;
+            const { id, document, warning, initialScrollTop } = prev[index];
+            const next = prev.slice();
+            next[index] = {
+                kind: "document",
+                id,
+                document,
+                warning,
+                initialScrollTop,
+            };
+            return next;
+        });
+    }, []);
+
     const handleScrollChange = useCallback(
         (tabId: string, scrollTop: number) => {
             patchTab(tabId, { initialScrollTop: scrollTop });
@@ -523,9 +681,12 @@ export function ChatView({
     // opacity-0 gate would flash the message out and fade it back in on every
     // remount. Existing chats mount with messages === [] and fetch async, so
     // they still start hidden and reveal once loaded.
-    const hasScrolledRef = useRef(messages.length > 0);
+    const hasScrolledRef = useRef(messages.length > 0 && !chatLoading);
+    const positionedChatRef = useRef<string | undefined>(
+        messages.length > 0 && !chatLoading ? chatId : undefined,
+    );
     const [messagesVisible, setMessagesVisible] = useState(
-        () => messages.length > 0,
+        () => messages.length > 0 && !chatLoading,
     );
     const [showScrollButton, setShowScrollButton] = useState(false);
     const [inputHeight, setInputHeight] = useState(0);
@@ -539,7 +700,9 @@ export function ChatView({
         observer.observe(el);
         update();
         return () => observer.disconnect();
-    }, []);
+        // Re-runs when the composer mounts: it is absent until access
+        // resolves, and the scroll button is positioned from its height.
+    }, [accessResolved]);
 
     useEffect(() => {
         if (latestUserMessageRef.current) {
@@ -557,7 +720,7 @@ export function ChatView({
                 `calc(100dvh - ${headerHeight + messageGap * 3 + userMessageHeight + paddingBottom + addedHeaderClearance}px)`,
             );
         }
-    }, [messages.length]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [messages.length]);
 
     const updateScrollButton = useCallback(() => {
         const c = messagesContainerRef.current;
@@ -579,35 +742,70 @@ export function ChatView({
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     };
 
-    const scrollLatestUserToTop = useCallback(() => {
-        requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-                const container = messagesContainerRef.current;
-                const element = latestUserMessageRef.current;
-                if (!container || !element) return;
-                container.scrollTo({
-                    top: element.offsetTop - CHAT_MESSAGE_TOP_PADDING,
-                    behavior: "smooth",
+    const scrollLatestUserToTop = useCallback(
+        (
+            behavior: ScrollBehavior = "smooth",
+            onPositioned?: () => void,
+        ) => {
+            let frame = requestAnimationFrame(() => {
+                frame = requestAnimationFrame(() => {
+                    const container = messagesContainerRef.current;
+                    const element = latestUserMessageRef.current;
+                    if (!container || !element) return;
+                    // Measure both nodes in viewport coordinates. `offsetTop`
+                    // can be relative to the centered inner column rather
+                    // than this scrolling element, which positions a
+                    // revisited thread at the wrong message.
+                    const messageTop =
+                        element.getBoundingClientRect().top -
+                        container.getBoundingClientRect().top +
+                        container.scrollTop;
+                    container.scrollTo({
+                        top: Math.max(
+                            0,
+                            messageTop - CHAT_MESSAGE_TOP_PADDING,
+                        ),
+                        behavior,
+                    });
+                    onPositioned?.();
                 });
             });
-        });
-    }, []);
+            return () => cancelAnimationFrame(frame);
+        },
+        [],
+    );
 
     useEffect(() => {
+        if (chatLoading) return;
         const last = messages[messages.length - 1];
-        if (last?.role === "user") scrollLatestUserToTop();
-    }, [messages, scrollLatestUserToTop]);
+        if (last?.role === "user") return scrollLatestUserToTop();
+    }, [chatLoading, messages, scrollLatestUserToTop]);
 
     useEffect(() => {
-        if (isResponseLoading) scrollLatestUserToTop();
-    }, [isResponseLoading, scrollLatestUserToTop]);
+        // A detached turn attaches before its stored history arrives. Wait for
+        // that history so the ref points at the latest user message in the
+        // complete transcript, rather than the turn's temporary one-message
+        // overlay.
+        if (isResponseLoading && !chatLoading)
+            return scrollLatestUserToTop();
+    }, [chatLoading, isResponseLoading, scrollLatestUserToTop]);
 
+    /* eslint-disable react-hooks/set-state-in-effect -- visibility is synchronized with completion of the selected chat's DOM positioning */
     useEffect(() => {
+        const viewingUnpositionedChat = positionedChatRef.current !== chatId;
+        if (chatLoading) {
+            hasScrolledRef.current = false;
+            // A live detached turn keeps `messages` non-empty while history
+            // loads, so the chat id/loading state—not an empty transcript—is
+            // what resets the positioning gate.
+            setMessagesVisible(false);
+            return;
+        }
         if (messages.length === 0) {
             hasScrolledRef.current = false;
-            // eslint-disable-next-line react-hooks/set-state-in-effect -- hide messages until scroll position is restored to avoid a visible jump
+            positionedChatRef.current = undefined;
             setMessagesVisible(false);
-        } else if (!hasScrolledRef.current) {
+        } else if (!hasScrolledRef.current || viewingUnpositionedChat) {
             const userMsgCount = messages.filter(
                 (m) => m.role === "user",
             ).length;
@@ -616,26 +814,19 @@ export function ChatView({
                 latestUserMessageRef.current &&
                 messagesContainerRef.current
             ) {
-                setTimeout(() => {
-                    const container = messagesContainerRef.current;
-                    const element = latestUserMessageRef.current;
-                    if (container && element) {
-                        container.scrollTo({
-                            top:
-                                element.offsetTop -
-                                CHAT_MESSAGE_TOP_PADDING,
-                            behavior: "instant",
-                        });
-                    }
+                return scrollLatestUserToTop("auto", () => {
                     hasScrolledRef.current = true;
+                    positionedChatRef.current = chatId;
                     setMessagesVisible(true);
-                }, 100);
+                });
             } else {
                 hasScrolledRef.current = true;
+                positionedChatRef.current = chatId;
                 setMessagesVisible(true);
             }
         }
-    }, [messages]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [chatId, chatLoading, messages, scrollLatestUserToTop]);
+    /* eslint-enable react-hooks/set-state-in-effect */
 
     useEffect(() => {
         if (panelMounted && window.innerWidth < 768) {
@@ -649,7 +840,7 @@ export function ChatView({
     }, [panelMounted]);
 
     const handleNewChat = () => {
-        cancel();
+        detach();
         setCurrentChatId(null);
         setNewChatMessages(null);
         router.push("/assistant");
@@ -754,312 +945,263 @@ export function ChatView({
         </HeaderButtonsUI>
     );
 
-    const rawActiveInput = (() => {
-        for (
-            let messageIndex = messages.length - 1;
-            messageIndex >= 0;
-            messageIndex--
-        ) {
-            const message = messages[messageIndex];
-            if (message.role === "user") return null;
-            if (message.role !== "assistant" || !message.events) continue;
-            for (
-                let eventIndex = message.events.length - 1;
-                eventIndex >= 0;
-                eventIndex--
-            ) {
-                const event = message.events[eventIndex];
-                if (event.type === "ask_inputs_response") {
-                    return null;
-                }
-                if (event.type === "ask_inputs") {
-                    if (!message.id) return null;
-                    return {
-                        key: `${message.id}:${event.event_id}`,
-                        assistantMessageId: message.id,
-                        event,
-                    };
-                }
-            }
-        }
-        return null;
-    })();
-    const activeInput =
-        rawActiveInput && !hiddenAskInputKeys.has(rawActiveInput.key)
-            ? rawActiveInput
-            : null;
-
     const messagesBottomPadding = DEFAULT_ASSISTANT_BOTTOM_PADDING;
 
     return (
         <div className="h-full w-full flex relative">
             {/* Chat column */}
             <div className="flex min-w-0 flex-col h-full flex-1 relative">
-                <div
-                    data-slot="chat-header-actions"
-                    className="pointer-events-none absolute right-4 top-4.5 z-30 hidden md:block md:right-8"
-                >
-                    {renderChatHeaderActions()}
-                </div>
+                {onInitialSubmit ? (
+                    <InitialView
+                        onSubmit={onInitialSubmit}
+                        onDocumentClick={handleAttachedDocumentClick}
+                    />
+                ) : (
+                    <>
+                        <div
+                            data-slot="chat-header-actions"
+                            className="pointer-events-none absolute right-4 top-4.5 z-30 hidden md:block md:right-8"
+                        >
+                            {renderChatHeaderActions()}
+                        </div>
 
-                {mobileActionsContainer
-                    ? createPortal(
-                          <div className="flex min-w-0 items-center justify-end overflow-visible py-2 -my-2">
-                              {renderChatHeaderActions()}
-                          </div>,
-                          mobileActionsContainer,
-                      )
-                    : null}
+                        {mobileActionsContainer
+                            ? createPortal(
+                                  <div className="flex min-w-0 items-center justify-end overflow-visible py-2 -my-2">
+                                      {renderChatHeaderActions()}
+                                  </div>,
+                                  mobileActionsContainer,
+                              )
+                            : null}
 
-                {/* Scrollable messages */}
-                <div
-                    ref={messagesContainerRef}
-                    className="flex-1 w-full overflow-y-auto"
-                    style={{ scrollbarGutter: "stable both-edges" }}
-                >
-                    <div
-                        data-slot="chat-messages-content"
-                        className="w-full max-w-4xl mx-auto px-6 md:px-8 min-h-full flex flex-col relative"
-                        style={{
-                            paddingTop: CHAT_MESSAGE_TOP_PADDING,
-                            paddingBottom: messagesBottomPadding,
-                        }}
-                    >
-                        {!messagesVisible && (
-                            <div className="space-y-6 md:space-y-8 w-full">
-                                <div className="flex justify-end">
-                                    <div className="bg-gray-100 rounded-2xl p-4 w-2/5">
-                                        <div className="theme-shimmer h-4 bg-[length:200%_100%] animate-[shimmer_2s_ease-in-out_infinite] rounded w-full" />
+                        {/* Scrollable messages */}
+                        <div
+                            ref={messagesContainerRef}
+                            className="flex-1 w-full overflow-y-auto"
+                            style={{ scrollbarGutter: "stable both-edges" }}
+                        >
+                            <div
+                                data-slot="chat-messages-content"
+                                className="w-full max-w-4xl mx-auto px-6 md:px-8 min-h-full flex flex-col relative"
+                                style={{
+                                    paddingTop: CHAT_MESSAGE_TOP_PADDING,
+                                    paddingBottom: messagesBottomPadding,
+                                }}
+                            >
+                                {!messagesVisible && (
+                                    <div className="space-y-6 md:space-y-8 w-full">
+                                        <div className="flex justify-end">
+                                            <div className="bg-gray-100 rounded-2xl p-4 w-2/5">
+                                                <div className="theme-shimmer h-4 bg-[length:200%_100%] animate-[shimmer_2s_ease-in-out_infinite] rounded w-full" />
+                                            </div>
+                                        </div>
+                                        <div className="space-y-3">
+                                            {[1, 2, 3, 4].map((i) => (
+                                                <div
+                                                    key={i}
+                                                    className={`theme-shimmer h-4 bg-[length:200%_100%] animate-[shimmer_2s_ease-in-out_infinite] rounded ${i === 3 ? "w-5/6" : i === 4 ? "w-4/6" : "w-full"}`}
+                                                />
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                                <div
+                                    className="space-y-6 md:space-y-8 transition-opacity duration-150"
+                                    style={{ opacity: messagesVisible ? 1 : 0 }}
+                                >
+                                    {(() => {
+                                        const lastUserIndex = messages
+                                            .map((m) => m.role)
+                                            .lastIndexOf("user");
+                                        const lastAssistantIndex = messages
+                                            .map((m) => m.role)
+                                            .lastIndexOf("assistant");
+                                        return messages.map((msg, i) => (
+                                            <div
+                                                key={msg.id ?? i}
+                                                ref={
+                                                    i === lastUserIndex
+                                                        ? latestUserMessageRef
+                                                        : null
+                                                }
+                                            >
+                                                {msg.role === "user" ? (
+                                                    <UserMessage
+                                                        content={msg.content ?? ""}
+                                                        files={msg.files}
+                                                        workflow={msg.workflow}
+                                                        onWorkflowClick={(wf) => {
+                                                            setWorkflowModalInitialId(
+                                                                wf.id,
+                                                            );
+                                                            setWorkflowModalOpen(true);
+                                                        }}
+                                                        onFileClick={(file) => {
+                                                            if (!file.document_id)
+                                                                return;
+                                                            openDocument({
+                                                                documentId:
+                                                                    file.document_id,
+                                                                filename:
+                                                                    file.filename,
+                                                                versionId:
+                                                                    file.version_id ??
+                                                                    null,
+                                                                versionNumber:
+                                                                    file.version_number ??
+                                                                    null,
+                                                            });
+                                                        }}
+                                                    />
+                                                ) : (
+                                                    <AssistantMessage
+                                                        events={msg.events}
+                                                        isStreaming={
+                                                            i === messages.length - 1 &&
+                                                            isResponseLoading
+                                                        }
+                                                        isError={!!msg.error}
+                                                        errorMessage={
+                                                            typeof msg.error ===
+                                                            "string"
+                                                                ? msg.error
+                                                                : undefined
+                                                        }
+                                                        citations={msg.citations}
+                                                        citationStatus={
+                                                            msg.citationStatus
+                                                        }
+                                                        activeCitation={
+                                                            activeCitation
+                                                        }
+                                                        onCitationClick={(citation) =>
+                                                            void openCitation(citation)
+                                                        }
+                                                        onOpenCitationSource={(
+                                                            citation,
+                                                        ) =>
+                                                            void openCitation(
+                                                                citation,
+                                                                {
+                                                                    showQuotes: false,
+                                                                },
+                                                            )
+                                                        }
+                                                        onCaseClick={(citation) =>
+                                                            openCase(citation)
+                                                        }
+                                                        minHeight={
+                                                            i === lastAssistantIndex
+                                                                ? minHeight
+                                                                : "0px"
+                                                        }
+                                                        onWorkflowClick={(id) => {
+                                                            setWorkflowModalInitialId(
+                                                                id,
+                                                            );
+                                                            setWorkflowModalOpen(true);
+                                                        }}
+                                                        onEditViewClick={openEditor}
+                                                        onOpenDocument={openDocument}
+                                                        onEditResolveStart={
+                                                            handleEditResolveStart
+                                                        }
+                                                        onEditResolved={
+                                                            handleEditResolved
+                                                        }
+                                                        onEditError={handleEditError}
+                                                        isDocReloading={(docId) =>
+                                                            reloadingDocIds.has(docId)
+                                                        }
+                                                        isEditReloading={(editId) =>
+                                                            reloadingEditIds.has(editId)
+                                                        }
+                                                        resolvedEditStatuses={
+                                                            resolvedEditStatuses
+                                                        }
+                                                    />
+                                                )}
+                                            </div>
+                                        ));
+                                    })()}
+                                    <div ref={messagesEndRef} />
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10">
+                            <div className="mx-auto h-28 w-full max-w-4xl px-4 md:px-6">
+                                <div className="assistant-chat-input-fade h-full w-full" />
+                            </div>
+                        </div>
+
+                        {/* Scroll to bottom button */}
+                        {showScrollButton && (
+                            <div
+                                className="absolute left-1/2 -translate-x-1/2 z-19"
+                                style={{
+                                    bottom:
+                                        inputHeight +
+                                        CHAT_INPUT_BOTTOM_OFFSET +
+                                        SCROLL_BUTTON_INPUT_GAP,
+                                }}
+                            >
+                                <button
+                                    onClick={scrollToBottom}
+                                    className={`cursor-pointer rounded-full p-2 transition-all ${LIQUID_GLASS_TRANSLUCENT_ACTION_CLASS}`}
+                                >
+                                    <ArrowDown className="h-6 w-6 text-gray-500" />
+                                </button>
+                            </div>
+                        )}
+
+                        {/* Chat input */}
+                        {accessResolved && (
+                            <div className="absolute bottom-3 left-0 right-0 w-full z-30">
+                                <div className="pointer-events-none absolute -bottom-3 left-0 right-0 z-0">
+                                    <div className="mx-auto h-7 w-full max-w-4xl px-4 md:px-6">
+                                        <div className="h-full rounded-t-[20px] bg-app-background" />
                                     </div>
                                 </div>
-                                <div className="space-y-3">
-                                    {[1, 2, 3, 4].map((i) => (
-                                        <div
-                                            key={i}
-                                            className={`theme-shimmer h-4 bg-[length:200%_100%] animate-[shimmer_2s_ease-in-out_infinite] rounded ${i === 3 ? "w-5/6" : i === 4 ? "w-4/6" : "w-full"}`}
-                                        />
-                                    ))}
+                                <div
+                                    ref={measuredInputRef}
+                                    className="relative z-20 w-full max-w-4xl mx-auto px-4 md:px-6"
+                                >
+                                    <div className="w-full rounded-t-[20px] bg-transparent">
+                                        <ChatInputPrompt
+                                            messages={messages}
+                                            chatKey={chatId}
+                                            canSend={canSend}
+                                            chatLoading={chatLoading}
+                                            onSubmit={(response, content, files) => {
+                                                void handleChat(
+                                                    { role: "user", content, files },
+                                                    { askInputsResponse: response },
+                                                );
+                                            }}
+                                            onCancel={cancel}
+                                        >
+                                            <ChatInput
+                                                ref={chatInputRef}
+                                                canSend={canSend}
+                                                chatLoading={chatLoading}
+                                                onSubmit={handleChat}
+                                                onCancel={cancel}
+                                                isLoading={isResponseLoading}
+                                                chatKey={chatId}
+                                                chatModel={chatModel}
+                                                chatReasoningLevel={chatReasoningLevel}
+                                                onDocumentClick={
+                                                    handleAttachedDocumentClick
+                                                }
+                                            />
+                                        </ChatInputPrompt>
+                                    </div>
                                 </div>
                             </div>
                         )}
-                        <div
-                            className="space-y-6 md:space-y-8 transition-opacity duration-150"
-                            style={{ opacity: messagesVisible ? 1 : 0 }}
-                        >
-                            {(() => {
-                                const lastUserIndex = messages
-                                    .map((m) => m.role)
-                                    .lastIndexOf("user");
-                                const lastAssistantIndex = messages
-                                    .map((m) => m.role)
-                                    .lastIndexOf("assistant");
-                                return messages.map((msg, i) => (
-                                    <div
-                                        key={msg.id ?? i}
-                                        ref={
-                                            i === lastUserIndex
-                                                ? latestUserMessageRef
-                                                : null
-                                        }
-                                    >
-                                        {msg.role === "user" ? (
-                                            <UserMessage
-                                                content={msg.content ?? ""}
-                                                files={msg.files}
-                                                workflow={msg.workflow}
-                                                onWorkflowClick={(wf) => {
-                                                    setWorkflowModalInitialId(
-                                                        wf.id,
-                                                    );
-                                                    setWorkflowModalOpen(true);
-                                                }}
-                                                onFileClick={(file) => {
-                                                    if (!file.document_id)
-                                                        return;
-                                                    openDocument({
-                                                        documentId:
-                                                            file.document_id,
-                                                        filename:
-                                                            file.filename,
-                                                        versionId:
-                                                            file.version_id ??
-                                                            null,
-                                                        versionNumber:
-                                                            file.version_number ??
-                                                            null,
-                                                    });
-                                                }}
-                                            />
-                                        ) : (
-                                            <AssistantMessage
-                                                events={msg.events}
-                                                isStreaming={
-                                                    i === messages.length - 1 &&
-                                                    isResponseLoading
-                                                }
-                                                isError={!!msg.error}
-                                                errorMessage={
-                                                    typeof msg.error ===
-                                                    "string"
-                                                        ? msg.error
-                                                        : undefined
-                                                }
-                                                citations={msg.citations}
-                                                citationStatus={
-                                                    msg.citationStatus
-                                                }
-                                                activeCitation={
-                                                    activeCitation
-                                                }
-                                                onCitationClick={(citation) =>
-                                                    void openCitation(citation)
-                                                }
-                                                onOpenCitationSource={(
-                                                    citation,
-                                                ) =>
-                                                    void openCitation(
-                                                        citation,
-                                                        {
-                                                            showQuotes: false,
-                                                        },
-                                                    )
-                                                }
-                                                onCaseClick={(citation) =>
-                                                    openCase(citation)
-                                                }
-                                                minHeight={
-                                                    i === lastAssistantIndex
-                                                        ? minHeight
-                                                        : "0px"
-                                                }
-                                                onWorkflowClick={(id) => {
-                                                    setWorkflowModalInitialId(
-                                                        id,
-                                                    );
-                                                    setWorkflowModalOpen(true);
-                                                }}
-                                                onEditViewClick={openEditor}
-                                                onOpenDocument={openDocument}
-                                                onEditResolveStart={
-                                                    handleEditResolveStart
-                                                }
-                                                onEditResolved={
-                                                    handleEditResolved
-                                                }
-                                                onEditError={handleEditError}
-                                                isDocReloading={(docId) =>
-                                                    reloadingDocIds.has(docId)
-                                                }
-                                                isEditReloading={(editId) =>
-                                                    reloadingEditIds.has(editId)
-                                                }
-                                                resolvedEditStatuses={
-                                                    resolvedEditStatuses
-                                                }
-                                            />
-                                        )}
-                                    </div>
-                                ));
-                            })()}
-                            <div ref={messagesEndRef} />
-                        </div>
-                    </div>
-                </div>
-
-                <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10">
-                    <div className="mx-auto h-28 w-full max-w-4xl px-4 md:px-6">
-                        <div className="assistant-chat-input-fade h-full w-full" />
-                    </div>
-                </div>
-
-                {/* Scroll to bottom button */}
-                {showScrollButton && (
-                    <div
-                        className="absolute left-1/2 -translate-x-1/2 z-19"
-                        style={{
-                            bottom:
-                                inputHeight +
-                                CHAT_INPUT_BOTTOM_OFFSET +
-                                SCROLL_BUTTON_INPUT_GAP,
-                        }}
-                    >
-                        <button
-                            onClick={scrollToBottom}
-                            className={`cursor-pointer rounded-full p-2 transition-all ${LIQUID_GLASS_TRANSLUCENT_ACTION_CLASS}`}
-                        >
-                            <ArrowDown className="h-6 w-6 text-gray-500" />
-                        </button>
-                    </div>
+                    </>
                 )}
-
-                {/* Chat input */}
-                <div className="absolute bottom-3 left-0 right-0 w-full z-30">
-                    <div className="pointer-events-none absolute -bottom-3 left-0 right-0 z-0">
-                        <div className="mx-auto h-7 w-full max-w-4xl px-4 md:px-6">
-                            <div className="h-full rounded-t-[20px] bg-app-background" />
-                        </div>
-                    </div>
-                    <div
-                        ref={measuredInputRef}
-                        className="relative z-20 w-full max-w-4xl mx-auto px-4 md:px-6"
-                    >
-                        <div className="w-full rounded-t-[20px] bg-transparent">
-                            {activeInput ? (
-                                <AskInputPopup
-                                    key={activeInput.key}
-                                    event={activeInput.event}
-                                    assistantMessageId={
-                                        activeInput.assistantMessageId
-                                    }
-                                    onSubmit={(response, content, files) => {
-                                        setHiddenAskInputKeys((prev) => {
-                                            const next = new Set(prev);
-                                            next.add(activeInput.key);
-                                            return next;
-                                        });
-                                        void handleChat(
-                                            { role: "user", content, files },
-                                            {
-                                                askInputsResponse: response,
-                                            },
-                                        );
-                                    }}
-                                    onDismiss={() => {
-                                        setHiddenAskInputKeys((prev) => {
-                                            const next = new Set(prev);
-                                            next.add(activeInput.key);
-                                            return next;
-                                        });
-                                        cancel();
-                                    }}
-                                />
-                            ) : (
-                                <ChatInput
-                                    ref={chatInputRef}
-                                    canSend={canSend}
-                                    onSubmit={handleChat}
-                                    onCancel={cancel}
-                                    isLoading={isResponseLoading}
-                                    chatKey={chatId}
-                                    chatModel={chatModel}
-                                    chatReasoningLevel={chatReasoningLevel}
-                                    onDocumentClick={(document) =>
-                                        openDocument({
-                                            documentId: document.id,
-                                            filename: document.filename,
-                                            versionId:
-                                                document.current_version_id ??
-                                                null,
-                                            versionNumber:
-                                                document.active_version_number ??
-                                                null,
-                                        })
-                                    }
-                                />
-                            )}
-                        </div>
-                    </div>
-                </div>
             </div>
 
             <AssistantWorkflowModal
@@ -1077,13 +1219,31 @@ export function ChatView({
                 />
             ) : null}
 
+            {/* TODO(contacts): GET /chat/:id (backend/src/routes/chat.ts)
+                serves chat + is_owner + access_role and no ranked contact
+                list, so there is nothing to thread into `contacts` here and
+                the "Ask …" line cannot render on chat surfaces. Needs a
+                server change (the shape project detail already returns as
+                `admin_contacts`) before this popup can name anybody. */}
             <PermissionDeniedPopup
                 open={!!actionGate}
                 action={actionGate?.action}
                 requiredRole={actionGate?.requiredRole}
+                title={actionGate?.title}
+                message={actionGate?.message}
                 onClose={() => setActionGate(null)}
             />
 
+            <ApiKeyMissingPopup
+                open={rejectedApiKey !== null}
+                title="API key rejected"
+                message={`${
+                    rejectedKeyProvider
+                        ? `The ${providerLabel(rejectedKeyProvider)} API key`
+                        : "That API key"
+                } was rejected. If it is your own key, check it in Settings; otherwise contact your administrator.`}
+                onClose={() => onDismissInvalidApiKey?.()}
+            />
             <WarningPopup
                 open={!!actionError}
                 title={actionError?.title ?? "Chat action failed"}
@@ -1112,6 +1272,7 @@ export function ChatView({
                         onEditResolved={handleEditResolved}
                         onEditError={handleEditError}
                         onWarningDismiss={handleWarningDismiss}
+                        onCloseAnnotation={handleCloseAnnotation}
                         onScrollChange={handleScrollChange}
                     />
                 </div>

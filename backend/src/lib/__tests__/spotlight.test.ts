@@ -5,9 +5,9 @@ import {
     spotlight,
     spotlightWorkflow,
     generateSpotlightNonce,
-} from "../chat/contextBuilders";
-import { buildSystemPrompt } from "../chat/prompts";
-import type { ChatMessage } from "../chat/types";
+} from "../../modules/chat/engine/contextBuilders";
+import { buildSystemPrompt } from "../../modules/chat/engine/prompts";
+import type { ChatMessage } from "../../modules/chat/engine/types";
 
 describe("spotlight (prompt-injection fence)", () => {
     it("puts the nonce on BOTH the opening and closing tags", () => {
@@ -55,6 +55,46 @@ describe("spotlight (prompt-injection fence)", () => {
         const b = generateSpotlightNonce();
         expect(a).toMatch(/^[0-9a-f]{32}$/);
         expect(a).not.toBe(b);
+    });
+
+    it("keeps the nonce stable for one conversation so provider prefix caches survive", () => {
+        // The nonce lands in the system prompt and in replayed turns. A value
+        // that changed per request would invalidate the provider's cached
+        // prefix on every turn, so it is derived from the conversation id
+        // under a server secret instead of minted fresh.
+        const previous = process.env.SPOTLIGHT_NONCE_SECRET;
+        process.env.SPOTLIGHT_NONCE_SECRET = "test-secret-for-spotlight";
+        try {
+            const first = generateSpotlightNonce("chat-1");
+            const again = generateSpotlightNonce("chat-1");
+            const other = generateSpotlightNonce("chat-2");
+            expect(first).toMatch(/^[0-9a-f]{32}$/);
+            expect(again).toBe(first);
+            expect(other).not.toBe(first);
+            // The conversation id itself must not be recoverable from the
+            // nonce, and the nonce must not simply be the id.
+            expect(first).not.toContain("chat-1");
+        } finally {
+            if (previous === undefined) delete process.env.SPOTLIGHT_NONCE_SECRET;
+            else process.env.SPOTLIGHT_NONCE_SECRET = previous;
+        }
+    });
+
+    it("falls back to a random nonce when no secret is configured", () => {
+        const previousSpotlight = process.env.SPOTLIGHT_NONCE_SECRET;
+        const previousDownload = process.env.DOWNLOAD_SIGNING_SECRET;
+        delete process.env.SPOTLIGHT_NONCE_SECRET;
+        delete process.env.DOWNLOAD_SIGNING_SECRET;
+        try {
+            expect(generateSpotlightNonce("chat-1")).not.toBe(
+                generateSpotlightNonce("chat-1"),
+            );
+        } finally {
+            if (previousSpotlight !== undefined)
+                process.env.SPOTLIGHT_NONCE_SECRET = previousSpotlight;
+            if (previousDownload !== undefined)
+                process.env.DOWNLOAD_SIGNING_SECRET = previousDownload;
+        }
     });
 
     it("neutralizes a smuggled workflow-instructions tag inside untrusted data", () => {

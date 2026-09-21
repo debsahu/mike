@@ -15,6 +15,7 @@ import { VersionChip } from "../shared/VersionChip";
 import type { Citation, EditAnnotation, PanelDocument } from "../shared/types";
 import { cn } from "@/app/lib/utils";
 import { LIQUID_GLASS_FLOAT_CLASS } from "@/app/components/ui/liquid-surface";
+import { reorderTabs, type TabDropPosition } from "@/app/lib/reorderTabs";
 
 // ---------------------------------------------------------------------------
 // Tab data
@@ -107,7 +108,7 @@ export function upsertAssistantSidePanelTab(
     return next;
 }
 
-export type AssistantTabDropPosition = "before" | "after";
+export type AssistantTabDropPosition = TabDropPosition;
 
 export function reorderAssistantSidePanelTabs(
     tabs: AssistantSidePanelTab[],
@@ -115,22 +116,7 @@ export function reorderAssistantSidePanelTabs(
     targetTabId: string,
     position: AssistantTabDropPosition,
 ): AssistantSidePanelTab[] {
-    const draggedIndex = tabs.findIndex((tab) => tab.id === draggedTabId);
-    const targetIndex = tabs.findIndex((tab) => tab.id === targetTabId);
-    if (draggedIndex < 0 || targetIndex < 0 || draggedTabId === targetTabId) {
-        return tabs;
-    }
-
-    const next = tabs.slice();
-    const [draggedTab] = next.splice(draggedIndex, 1);
-    const remainingTargetIndex = next.findIndex(
-        (tab) => tab.id === targetTabId,
-    );
-    const insertionIndex =
-        position === "after" ? remainingTargetIndex + 1 : remainingTargetIndex;
-    next.splice(insertionIndex, 0, draggedTab);
-
-    return next.every((tab, index) => tab === tabs[index]) ? tabs : next;
+    return reorderTabs(tabs, draggedTabId, targetTabId, position, (tab) => tab.id);
 }
 
 interface Props {
@@ -175,6 +161,11 @@ interface Props {
         message: string;
     }) => void;
     onWarningDismiss?: (tabId: string) => void;
+    /**
+     * Drops a tab back to a plain document view, dismissing the citation quote
+     * or tracked change shown above the viewer.
+     */
+    onCloseAnnotation?: (tabId: string) => void;
     onScrollChange?: (tabId: string, scrollTop: number) => void;
 }
 
@@ -206,6 +197,7 @@ export function AssistantSidePanel({
     onEditResolved,
     onEditError,
     onWarningDismiss,
+    onCloseAnnotation,
     onScrollChange,
 }: Props) {
     const panelRef = useRef<HTMLDivElement>(null);
@@ -534,8 +526,10 @@ export function AssistantSidePanel({
                             key={tab.id}
                             className={`absolute inset-0 flex flex-col ${isActive ? "" : "invisible pointer-events-none"}`}
                             aria-hidden={!isActive}
+                            inert={!isActive}
                         >
                             <DocPanel
+                                active={isActive}
                                 document={tab.document}
                                 mode={mode}
                                 isReloading={
@@ -547,6 +541,12 @@ export function AssistantSidePanel({
                                 warning={tab.warning ?? null}
                                 onWarningDismiss={() =>
                                     onWarningDismiss?.(tab.id)
+                                }
+                                onCloseAnnotation={
+                                    tab.kind !== "document" &&
+                                    onCloseAnnotation
+                                        ? () => onCloseAnnotation(tab.id)
+                                        : undefined
                                 }
                                 initialScrollTop={tab.initialScrollTop ?? null}
                                 onScrollChange={(scrollTop) =>

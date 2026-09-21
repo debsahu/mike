@@ -31,6 +31,40 @@ not evidence that an older database has completed every upgrade step. The
 repository's schema-drift CI separately checks that its pinned historical
 baseline converges with the fresh schema after all later migrations run.
 
+### After the organization-access upgrade: `tabular_review_legacy_shares`
+
+`20260904_02_migrate_legacy_sharing.sql` converts the old roleless
+`shared_with` arrays into real access grants. One shape has nowhere to go: a
+tabular review that lives INSIDE a project now inherits access from that
+project, so a share on the review alone cannot be reproduced without handing
+the recipient the whole matter. That migration dropped
+`tabular_reviews.shared_with` without recording those recipients.
+
+`20260917_01_organization_access_followup.sql` creates
+`public.tabular_review_legacy_shares` as the place those `(review, project,
+email)` triples belong, and backfills it only if the `shared_with` column
+still exists when it runs. On a deployment that already applied
+`20260904_02` the column is gone, so the table lands EMPTY: the recipients
+are recoverable only from a pre-upgrade backup. To recover them, restore the
+old `shared_with` values into a scratch column named `shared_with` on
+`tabular_reviews`, re-run `20260917_01` (it is safe to re-run), then drop the
+scratch column. Fresh installs create the table empty and nothing writes it
+at runtime. The table carries no foreign keys, so the record survives the
+review or project being deleted. It is `service_role`-only; read it with the
+service key:
+
+```sql
+select l.email, l.project_id, l.tabular_review_id, l.archived_at
+from public.tabular_review_legacy_shares l
+order by l.archived_at desc;
+```
+
+Each row is a person who could see that review before the upgrade and cannot
+now. For each one, decide deliberately: grant them access to the project (or
+add them to the organization) if they should still have it, and otherwise do
+nothing. The table is a record, not a queue — nothing reads it, and rows may
+be deleted once every recipient has been dealt with.
+
 Apply the workflow catalog migration before deploying the matching backend
 release, then run the dedicated ingestion job from the built backend artifact:
 
@@ -161,8 +195,9 @@ Deployments must therefore run `backend/src/index.ts`
 without starting its worker.
 
 Model-provider keys and the CourtListener token can be configured globally in
-`backend/.env` or per user under **Settings > API Keys**. When a key is
-configured globally, its matching field is read-only.
+`backend/.env` or per user under **Settings > API Keys**. A personal key takes
+precedence over the matching globally configured key; removing the personal
+key restores the global key as the fallback.
 
 ## Authentication email
 
@@ -417,6 +452,20 @@ extra process management is needed. To run them on separate hardware, start
 `node dist/worker.js` (any number of instances — work is partitioned safely)
 and set `WORKERS_MODE=none` on the API process. The compose file contains a
 commented `worker` service demonstrating this.
+
+### Document lifecycle migration
+
+Apply `20260914_01_document_lifecycle.sql` before deploying the backend that uses
+its version RPCs. Fresh installs include it in `backend/schema.sql`; Compose's
+`db-init` service applies it during upgrades. Do not remove pending
+`document.cleanup` jobs: they retain the object keys needed to finish erasure.
+The migration makes both queue claim paths recover failed cleanup jobs, including
+ones rejected by an older worker during rollout, and exhausted stale claims.
+Keep failed cleanup rows as well as pending ones; upgraded workers reclaim them.
+
+Backend and frontend Docker build contexts are now the repository root, so both
+can compile against `packages/contracts`. For a manual backend image build use
+`docker build -f backend/Dockerfile -t mike-backend .` from the root.
 
 ## Deployment safety
 

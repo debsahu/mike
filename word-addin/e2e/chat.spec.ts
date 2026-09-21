@@ -2190,6 +2190,55 @@ test("keeps an edit reviewable through its passage when Word withholds revision 
   expect(calls.rejectedChanges).toEqual([]);
 });
 
+test("does not claim an edit was applied when the mutation sync failed before Word changed the document", async ({
+  addin,
+  page,
+}) => {
+  await addin.mockChatStream([
+    wordEdits(replacementEdit("The Suplier", "The Supplier", "Typo.")),
+  ]);
+  await addin.gotoTaskpane({
+    documentText: "The Suplier will deliver the goods.",
+    trackedMutationSyncFailure: "before-apply",
+  });
+  await addin.expectAuthedShell();
+
+  await page.getByPlaceholder("How can I help?").fill("Fix the typo");
+  await page.getByRole("button", { name: "Send" }).click();
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+
+  await expect(page.getByText("Couldn’t apply this change.")).toBeVisible();
+  await expect(
+    page.getByText("Applied in Word — review it from Word’s Review tab."),
+  ).toHaveCount(0);
+  expect((await addin.wordCalls()).trackedChanges).toEqual([]);
+});
+
+test("reports an unmanaged edit only when a failed mutation sync left the expected revisions", async ({
+  addin,
+  page,
+}) => {
+  await addin.mockChatStream([
+    wordEdits(replacementEdit("The Suplier", "The Supplier", "Typo.")),
+  ]);
+  await addin.gotoTaskpane({
+    documentText: "The Suplier will deliver the goods.",
+    trackedMutationSyncFailure: "after-apply",
+  });
+  await addin.expectAuthedShell();
+
+  await page.getByPlaceholder("How can I help?").fill("Fix the typo");
+  await page.getByRole("button", { name: "Send" }).click();
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+
+  await expect(
+    page.getByText("Applied in Word — review it from Word’s Review tab."),
+  ).toBeVisible();
+  expect((await addin.wordCalls()).trackedChanges).toEqual([
+    { text: "The Supplier", location: "After", original: "The Suplier" },
+  ]);
+});
+
 test("edits sharing replacement text resolve independently by location", async ({
   addin,
   page,

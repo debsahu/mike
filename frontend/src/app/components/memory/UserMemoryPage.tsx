@@ -7,8 +7,8 @@ import { SettingsCard } from "@/app/components/settings/SettingsCard";
 import { SettingsHeading } from "@/app/components/settings/SettingsHeading";
 import { SettingsRow } from "@/app/components/settings/SettingsRow";
 import { MarkdownEditor } from "@/app/components/ui/markdown-editor";
-import { PillButton } from "@/app/components/ui/pill-button";
-import { ToggleSwitch } from "@/app/components/ui/toggle-switch";
+import { PillButtonUI } from "@/shared/ui/PillButtonUI";
+import { ToggleSwitchUI } from "@/shared/ui/ToggleSwitchUI";
 import {
   SettingsDescription,
   SettingsLabel,
@@ -59,7 +59,7 @@ export function UserMemoryPage() {
     changeDraft,
     setError,
     setAutosaveError,
-    useLatestConflict,
+    reloadLatest,
     keepDraftAfterConflict,
   } = useMemoryFileController({
     canEdit: true,
@@ -70,6 +70,8 @@ export function UserMemoryPage() {
     conflictLoadError:
       "Memory changed while you were editing. Reload the page before saving again.",
     saveError: "Memory could not be saved. Your draft has been kept.",
+    disabledError:
+      "Memory was turned off while you were editing, so your changes were not saved.",
   });
 
   const interactionLocked =
@@ -80,6 +82,10 @@ export function UserMemoryPage() {
     if (interactionLocked) return;
     setSettingsMutation("enable");
     setError(null);
+    // A refusal from the disabled period ("your changes were not saved") is
+    // over once memory is on again; leaving it up next to the fresh file
+    // reads as if the new file were already failing.
+    setAutosaveError(null);
     try {
       syncCurrent(await setUserMemoryEnabled(true));
     } catch (cause) {
@@ -145,9 +151,9 @@ export function UserMemoryPage() {
                   Could not load memory settings. Please try again.
                 </p>
               </div>
-              <PillButton tone="white" size="sm" onClick={() => void load()}>
+              <PillButtonUI tone="white" size="sm" onClick={() => void load()}>
                 Retry
-              </PillButton>
+              </PillButtonUI>
             </SettingsRow>
           ) : (
             <SettingsRow>
@@ -159,7 +165,7 @@ export function UserMemoryPage() {
                 </SettingsDescription>
               </div>
               <div className="flex items-center gap-3">
-                <ToggleSwitch
+                <ToggleSwitchUI
                   checked={memory.enabled}
                   disabled={interactionLocked}
                   aria-busy={settingsMutation === "enable"}
@@ -182,6 +188,13 @@ export function UserMemoryPage() {
         {error ? (
           <p className="text-sm text-red-600" role="alert">
             {error}
+          </p>
+        ) : null}
+        {!loading && memory && !memory.enabled && autosaveError ? (
+          // The editor (and its status line) is gone once memory is off, but
+          // the reason a draft was refused must still be visible.
+          <p className="text-sm text-red-600" role="alert">
+            {autosaveError}
           </p>
         ) : null}
       </section>
@@ -217,7 +230,7 @@ export function UserMemoryPage() {
 
           {conflict ? (
             <MemoryConflictNotice
-              onReload={useLatestConflict}
+              onReload={reloadLatest}
               onKeepDraft={keepDraftAfterConflict}
             />
           ) : null}
@@ -297,7 +310,7 @@ function ProjectMemoryDefaultRow() {
           </p>
         ) : null}
       </div>
-      <ToggleSwitch
+      <ToggleSwitchUI
         checked={profile?.projectMemoryDefault !== false}
         disabled={!profile || saving}
         aria-busy={saving}

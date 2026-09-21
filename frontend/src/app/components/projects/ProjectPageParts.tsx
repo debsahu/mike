@@ -20,10 +20,7 @@ import type { DocumentVersion } from "@/app/lib/mikeApi";
 import { RowActions } from "@/app/components/shared/RowActions";
 import { HeaderActionsMenu } from "@/app/components/shared/HeaderActionsMenu";
 import { DocumentUploadMenu } from "@/app/components/shared/DocumentUploadMenu";
-import {
-    TABLE_PRIMARY_CELL_WIDTH_CLASS,
-    tableTreeCellStyle,
-} from "@/app/components/shared/TablePrimitive";
+import { tableTreeCellStyle } from "@/app/components/shared/TablePrimitive";
 
 export type ProjectWorkspaceSection =
     | "documents"
@@ -38,7 +35,6 @@ export type ProjectContextMenu = {
     showFolderActions: boolean;
 };
 
-export const NAME_COL_W = TABLE_PRIMARY_CELL_WIDTH_CLASS;
 export const DOC_NAME_COL_W =
     "w-[292px] sm:w-[332px] md:w-[392px] lg:w-[452px] xl:w-[532px] 2xl:w-[592px] shrink-0";
 
@@ -367,7 +363,6 @@ export function ProjectPageHeader({
     project,
     search,
     activeSection,
-    creatingChat,
     creatingReview,
     canManageProject,
     roleKnown = true,
@@ -388,7 +383,6 @@ export function ProjectPageHeader({
     project: Project | null;
     search: string;
     activeSection: ProjectWorkspaceSection;
-    creatingChat: boolean;
     creatingReview: boolean;
     /** Whether the caller holds access.manage on this project. */
     canManageProject: boolean;
@@ -430,12 +424,8 @@ export function ProjectPageHeader({
             : activeSection === "assistant"
               ? {
                     onClick: onNewChat,
-                    disabled: creatingChat || !roleKnown,
-                    icon: creatingChat ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                        <Plus className="h-4 w-4" />
-                    ),
+                    disabled: !roleKnown,
+                    icon: <Plus className="h-4 w-4" />,
                     label: <span className="hidden sm:inline">Chat</span>,
                     title: "Create chat",
                 }

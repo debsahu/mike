@@ -12,6 +12,12 @@ const safetyMigration = readFileSync(
   resolve(backendRoot, "migrations/20260909_01_memory_safety_boundaries.sql"),
   "utf8",
 );
+// #451 shipped the two migrations above; every later SQL change to memory
+// objects lands in the follow-up migration and in schema.sql.
+const followupMigration = readFileSync(
+  resolve(backendRoot, "migrations/20260917_02_memory_followup.sql"),
+  "utf8",
+);
 const sources = [
   ["schema", schemaSql],
   ["migration", memoryMigration],
@@ -194,15 +200,178 @@ describe.each([
     expect(body).toContain("event->>'ask_event_id' = p_ask_event_id");
   });
 
+});
+
+describe.each([
+  ["schema", schemaSql],
+  ["follow-up migration", followupMigration],
+] as const)("%s memory follow-ups", (_name, sql) => {
+  it("replaces the two-argument app-memory check with the conversation-aware one", () => {
+    expect(sql).toMatch(
+      /grant execute\s+on function public\.memory_source_allows_app_memory\(text, uuid, uuid, uuid\)\s+to service_role/,
+    );
+    expect(sql).toMatch(
+      /grant execute\s+on function public\.memory_project_is_private\(uuid\)\s+to service_role/,
+    );
+    // The two-argument form may only appear as the drop of the shipped object.
+    const twoArg = sql.match(/memory_source_allows_app_memory\(text, uuid\)/g) ?? [];
+    const drops = sql.match(
+      /drop function if exists public\.memory_source_allows_app_memory\(text, uuid\)/g,
+    ) ?? [];
+    expect(twoArg.length).toBe(drops.length);
+  });
+
   it("deletes app and private-project memory transactionally", () => {
     const body = functionBody(sql, "delete_user_private_memories");
-    expect(body).toContain("lock table public.projects in share mode");
-    expect(body).toContain(
-      "lock table public.project_access_grants in share mode",
-    );
+    // Eligibility is pinned with row locks on the caller's own private
+    // projects. A table-level SHARE lock also worked, but it stalled every
+    // project write in the system from a user-facing DELETE route.
+    expect(body).not.toContain("lock table");
+    expect(body).toContain("where project.user_id = p_user_id and project.org_id is null");
+    expect(body).toContain("for update;");
     expect(body).toContain("file.scope = 'user'");
     expect(body).toContain("project.org_id is null");
     expect(body).toContain("not exists (");
     expect(body).toContain("perform public.wipe_memory_file");
+  });
+
+  it("scopes app-memory eligibility to the conversation, not just the project", () => {
+    const body = functionBody(sql, "memory_source_allows_app_memory");
+    // A standalone chat has no project. Answering "eligible" for every such
+    // chat let a chat shared with a colleague learn into the owner's private
+    // app memory. The three read-path tests now apply to chat and tabular
+    // alike: own conversation, no organization, no direct grants.
+    expect(body).toContain("p_conversation_id");
+    expect(body).toContain("p_actor_user_id");
+    expect(body).toContain("public.chats");
+    expect(body).toContain("public.tabular_review_chats");
+    expect(body).not.toMatch(
+      /when p_surface = 'chat' and p_project_id is null then true/,
+    );
+  });
+
+  it("answers a lost race as P0001 so PostgREST replies instead of hanging", () => {
+    // PostgREST treats SQLSTATE 40001 as a retryable transaction failure and
+    // never delivered a response for it here: the browser request stayed
+    // pending and the session sat "idle in transaction (aborted)".
+    expect(sql).not.toMatch(/errcode = '40001'/);
+    for (const conflict of [
+      "memory_source_changed",
+      "memory_conversation_deleted",
+      "memory_job_superseded",
+      "memory_epoch_conflict",
+      "memory_revision_conflict",
+      "memory_scope_ineligible",
+    ]) {
+      expect(sql).toContain(
+        `raise exception using errcode = 'P0001', message = '${conflict}'`,
+      );
+    }
+  });
+
+  it("hardens every SECURITY DEFINER memory function with pg_temp", () => {
+    for (const name of [
+      "create_project_with_memory",
+      "lock_memory_conversation_source",
+      "begin_memory_conversation_turn",
+      "release_memory_conversation_turn",
+      "memory_source_allows_app_memory",
+      "write_memory_file",
+      "wipe_memory_file",
+      "delete_user_private_memories",
+      "schedule_memory_consolidation",
+      "set_memory_consolidation_status",
+      "refresh_memory_file_status",
+    ]) {
+      expect(functionBody(sql, name)).toContain(
+        "set search_path = public, pg_temp",
+      );
+    }
+  });
+
+  it("locks only this conversation's memory files, through the unique indexes", () => {
+    const body = functionBody(sql, "schedule_memory_consolidation");
+    // "user_id in (subquery) or project_id = ..." under a top-level OR cannot
+    // be served from either unique index, so every assistant turn scanned and
+    // row-locked the whole memory_files table.
+    expect(body).toContain("pending_actor_ids");
+    expect(body).toContain("locked_user_file.user_id = any(pending_actor_ids)");
+    expect(body).toContain("union all");
+    expect(body).not.toMatch(
+      /memory_file\.user_id in \([\s\S]{0,400}?\)\s*\)?\s*or\s+memory_file\.project_id/,
+    );
+  });
+
+  it("raises when the consolidation state row is missing instead of doing nothing", () => {
+    const body = functionBody(sql, "schedule_memory_consolidation");
+    expect(body).toContain("memory_state_missing");
+  });
+
+  it("keeps an expired lease for a day so a long turn stays schedulable", () => {
+    const body = functionBody(sql, "begin_memory_conversation_turn");
+    // The scheduler proves a turn's activity id by deleting its own lease row.
+    // Reaping every expired lease made a turn that outlived its lease silently
+    // unschedulable the moment anyone else spoke.
+    expect(body).toContain("expires_at <= now() - interval '1 day'");
+    expect(body).not.toMatch(/and expires_at <= now\(\);/);
+  });
+
+  it("retimes deferred work to the quiet window in both directions", () => {
+    const release = functionBody(sql, "release_memory_conversation_turn");
+    expect(release).toContain("set run_at = next_quiet_until");
+    // A flat one-minute deferral re-woke the worker every minute for as long
+    // as the conversation stayed active.
+    expect(release).not.toContain("interval '1 minute'");
+    expect(release).not.toContain("set run_at = greatest(run_at");
+  });
+
+  it("verifies the tabular chat owner before trusting the locked source", () => {
+    const body = functionBody(sql, "lock_memory_conversation_source");
+    // The tabular branch reused one variable for both the pre-lock read and
+    // the post-lock re-read, so its own comparison could never fail, and it
+    // never re-checked the chat owner at all.
+    expect(body).toContain("review_owner_user_id");
+    expect(body).toContain("verified_review_owner_user_id");
+    expect(body).toContain(
+      "verified_owner_user_id is distinct from owner_user_id",
+    );
+    expect(body).toContain(
+      "verified_review_owner_user_id is distinct from review_owner_user_id",
+    );
+  });
+
+  it("indexes the memory tables for cascades, account erasure and the job probe", () => {
+    for (const index of [
+      // ON DELETE CASCADE from memory_files, and the retention sweep.
+      "memory_consolidation_results_file_idx",
+      "memory_consolidation_results_created_idx",
+      // Account deletion follows these five user references.
+      "memory_files_updated_by_idx",
+      "memory_consolidation_states_actor_idx",
+      "memory_conversation_activity_actor_idx",
+      "memory_conversation_activity_turn_actor_idx",
+      "memory_conversation_activity_project_actor_idx",
+      "memory_conversation_turn_leases_actor_idx",
+      // refresh_memory_file_status probes db_jobs by these JSON keys.
+      "db_jobs_memory_app_epoch_idx",
+      "db_jobs_memory_project_epoch_idx",
+    ]) {
+      expect(sql).toContain(`create index if not exists ${index}`);
+    }
+  });
+});
+
+describe("chat_messages index hygiene", () => {
+  it("drops the single-column index the memory composite index supersedes", () => {
+    // idx_chat_messages_chat(chat_id) is a strict prefix of
+    // chat_messages_chat_created_id_idx(chat_id, created_at, id), so it only
+    // costs a write on the hottest insert table in the product.
+    expect(followupMigration).toContain(
+      "drop index if exists public.idx_chat_messages_chat",
+    );
+    expect(schemaSql).toContain(
+      "create index if not exists chat_messages_chat_created_id_idx",
+    );
+    expect(schemaSql).not.toContain("idx_chat_messages_chat");
   });
 });

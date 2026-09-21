@@ -4,6 +4,7 @@ import { useEditor, EditorContent, useEditorState } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { TableKit } from "@tiptap/extension-table";
 import { Markdown } from "tiptap-markdown";
+import { marked } from "marked";
 import { useEffect, useRef, useState } from "react";
 import {
   Bold,
@@ -16,7 +17,6 @@ import {
   ListOrdered,
   Table2,
 } from "lucide-react";
-import { Button } from "@/app/components/ui/button";
 import { EDITOR_SURFACE_CLASS } from "@/app/components/ui/liquid-surface";
 import {
   DropdownMenu,
@@ -66,7 +66,17 @@ function comparableMarkdown(value: string) {
 }
 
 function markdownRoundTrips(source: string, serialized: string) {
-  return comparableMarkdown(source) === comparableMarkdown(serialized);
+  const original = comparableMarkdown(source);
+  const normalized = comparableMarkdown(serialized);
+  if (original === normalized) return true;
+  // Rich editing normalizes equivalent syntax (list markers, emphasis,
+  // heading styles, table padding). Compare rendered structure so those
+  // changes do not lock the editor in raw mode. Lost content and meaningful
+  // formatting, such as hard breaks, still require the lossless raw view.
+  return (
+    marked.parse(original, { async: false }) ===
+    marked.parse(normalized, { async: false })
+  );
 }
 
 const TABLE_PICKER_MAX_ROWS = 8;
@@ -95,24 +105,23 @@ function AppToolbarButton({
   disabled?: boolean;
 }) {
   return (
-    <Button
+    <button
       type="button"
-      variant="ghost"
-      size="icon-sm"
       disabled={disabled}
       title={title}
       aria-label={title}
       aria-pressed={active}
-      className={`h-7 w-7 text-gray-600 hover:bg-white hover:text-gray-900 ${
-        active ? "bg-gray-300 text-gray-950 hover:bg-gray-300" : ""
-      }`}
+      className={cn(
+        "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-gray-600 transition-colors hover:bg-white hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",
+        active && "bg-gray-300 text-gray-950 hover:bg-gray-300",
+      )}
       onMouseDown={(e) => {
         e.preventDefault(); // keep editor focus
       }}
       onClick={onClick}
     >
       {children}
-    </Button>
+    </button>
   );
 }
 
@@ -132,6 +141,9 @@ export function MarkdownEditor({
   allowTables = true,
 }: MarkdownEditorProps) {
   const lastEmittedRef = useRef(value);
+  // The first sync must check the initial content too; after that only an
+  // external change can alter what the editor holds.
+  const roundTripCheckedRef = useRef(false);
   const rawTextareaRef = useRef<HTMLTextAreaElement>(null);
   const tableInsertionSelectionRef = useRef<{
     from: number;
@@ -201,13 +213,35 @@ export function MarkdownEditor({
   useEffect(() => {
     if (!editor || editor.isDestroyed) return;
     const externalValueChanged = value !== lastEmittedRef.current;
-    if (value !== lastEmittedRef.current) {
+    if (externalValueChanged) {
       lastEmittedRef.current = value;
+      // Replacing the document collapses the selection to the start. When
+      // the user is mid-edit (a poll adopted a curator update, or the server
+      // normalised what was just saved) put the caret back where it was.
+      const { from, to } = editor.state.selection;
+      const restoreSelection = editor.isFocused;
       editor.commands.setContent(value, { emitUpdate: false });
+      if (restoreSelection) {
+        const size = editor.state.doc.content.size;
+        try {
+          editor.commands.setTextSelection({
+            from: Math.min(from, size),
+            to: Math.min(to, size),
+          });
+        } catch {
+          // A position that no longer exists keeps the default selection.
+        }
+      }
     }
     // Tiptap may normalize or omit Markdown syntax it cannot represent. Keep
     // such documents in the canonical raw editor so merely viewing and
-    // editing a memory file can never silently discard valid Markdown.
+    // editing a memory file can never silently discard valid Markdown. The
+    // check only means something against content the editor actually holds:
+    // after the user's own edit the document is already the source of truth
+    // (and in raw mode it is stale), so running it there produced a false
+    // "raw view preserves this Markdown" hint on every keystroke.
+    if (!externalValueChanged && roundTripCheckedRef.current) return;
+    roundTripCheckedRef.current = true;
     const roundTrips = markdownRoundTrips(value, getEditorMarkdown(editor));
     const syncFrame = window.requestAnimationFrame(() => {
       if (externalValueChanged) setRawMarkdown(value);
@@ -525,23 +559,21 @@ export function MarkdownEditor({
                 }}
               >
                 <DropdownMenuTrigger asChild>
-                  <Button
+                  <button
                     type="button"
-                    variant="ghost"
-                    size="icon-sm"
                     disabled={suspended}
                     title="Insert table"
                     aria-label="Insert table"
                     aria-pressed={tablePickerOpen}
-                    className={`h-7 w-7 text-gray-600 hover:bg-white hover:text-gray-900 ${
-                      tablePickerOpen
-                        ? "bg-gray-300 text-gray-950 hover:bg-gray-300"
-                        : ""
-                    }`}
+                    className={cn(
+                      "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-gray-600 transition-colors hover:bg-white hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",
+                      tablePickerOpen &&
+                        "bg-gray-300 text-gray-950 hover:bg-gray-300",
+                    )}
                     onPointerDown={rememberTableInsertionSelection}
                   >
                     <Table2 className="h-4 w-4" />
-                  </Button>
+                  </button>
                 </DropdownMenuTrigger>
                 <LiquidDropdownContent
                   align="start"
@@ -642,7 +674,10 @@ export function MarkdownEditor({
         </div>
       )}
       <div
-        className={`flex-1 overflow-y-auto transition-opacity ${
+        // A flex column so the raw textarea can take the whole editing area:
+        // `h-full` alone resolves to "auto" inside a flex item without an
+        // explicit height, which left the raw view two rows tall.
+        className={`flex flex-1 flex-col overflow-y-auto transition-opacity ${
           readOnly ? "border-t border-gray-100" : ""
         } ${suspended ? "opacity-50" : ""}`}
       >
@@ -653,7 +688,7 @@ export function MarkdownEditor({
             onChange={(event) => handleRawChange(event.target.value)}
             readOnly={readOnly || suspended}
             spellCheck={false}
-            className="h-full min-h-full w-full resize-none bg-transparent px-5 py-4 font-mono text-xs leading-6 text-gray-800 outline-none placeholder:text-gray-400 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-600/40 read-only:cursor-default"
+            className="h-full min-h-full w-full flex-1 resize-none bg-transparent px-5 py-4 font-mono text-xs leading-6 text-gray-800 outline-none placeholder:text-gray-400 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-600/40 read-only:cursor-default"
             aria-label={`${ariaLabel} (raw Markdown)`}
           />
         ) : (

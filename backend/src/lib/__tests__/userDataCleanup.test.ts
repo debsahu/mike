@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../storage", () => ({
+    assertStorageConfigured: vi.fn(),
     deleteFile: vi.fn(async () => {}),
     listFiles: vi.fn(async () => [] as string[]),
     // Kept real: cleanup must delete the exact key the
@@ -15,7 +16,7 @@ import {
     deleteAllUserTabularReviews,
     deleteUserProjects,
     deleteUserAccountData,
-} from "../userDataCleanup";
+} from "../../modules/user/user.dataCleanup";
 
 const deleteFileMock = vi.mocked(deleteFile);
 const listFilesMock = vi.mocked(listFiles);
@@ -124,6 +125,34 @@ function makeDb(
     };
     const db = {
         async rpc(name: string, args: Record<string, unknown>) {
+            // The cleanup worker's reference checks are body-based RPCs (a
+            // GET `in(...)` with hundreds of keys drew a gateway 414).
+            if (name === "document_cache_writer_active") {
+                const ids = args.p_version_ids as string[];
+                return {
+                    data: (tables.db_jobs ?? []).some(
+                        (row) =>
+                            row.kind === "document.precompute_text" &&
+                            row.status === "running" &&
+                            ids.includes(
+                                String((row.payload as Record<string, unknown> | undefined)?.versionId),
+                            ),
+                    ),
+                    error: null,
+                };
+            }
+            if (name === "document_cleanup_referenced_keys") {
+                const keys = args.p_keys as string[];
+                const referenced = new Set<string>();
+                for (const row of tables.document_versions ?? []) {
+                    if (row.deleted_at) continue;
+                    for (const column of ["storage_path", "pdf_storage_path"]) {
+                        const key = row[column];
+                        if (typeof key === "string" && keys.includes(key)) referenced.add(key);
+                    }
+                }
+                return { data: [...referenced].map((key) => ({ key })), error: null };
+            }
             if (name !== "wipe_memory_file") {
                 return { data: null, error: { message: `unknown rpc: ${name}` } };
             }
@@ -176,6 +205,11 @@ function makeDb(
                     narrow((row) => row[column] === value);
                     return query;
                 },
+                is: (column: string, value: unknown) => {
+                    narrow((row) => value === null ? row[column] == null : row[column] === value);
+                    return query;
+                },
+                limit: () => query,
                 order: () => query,
                 in: (column: string, values: unknown[]) => {
                     narrow((row) => values.includes(row[column]));
@@ -248,6 +282,7 @@ function makeDb(
 const ids = (rows: Row[] | undefined) => (rows ?? []).map((row) => row.id);
 
 beforeEach(() => {
+    vi.stubEnv("DB_JOBS_ENABLED", "false");
     deleteFileMock.mockClear();
     deleteFileMock.mockResolvedValue(undefined as never);
     listFilesMock.mockClear();
@@ -702,6 +737,23 @@ describe("deleteUserAccountData", () => {
         ]);
         expect(listFilesMock).toHaveBeenCalledWith("documents/u1/");
         expect(listFilesMock).toHaveBeenCalledWith("exports/u1/");
+    });
+
+    // Erasure's last steps are org settlement and — in the caller — the auth
+    // user itself. An object store that refuses DELETE must not abort the
+    // cascade before them: that combination leaves the content erased and the
+    // login still working. The trigger's db_jobs rows stay pending, so the
+    // bytes are still owned by a retryable record.
+    it("finishes the cascade when the object store refuses a delete", async () => {
+        const { db, tables } = fixture();
+        deleteFileMock.mockRejectedValue(new Error("storage unavailable"));
+        await expect(
+            deleteUserAccountData(db, "u1", "u1@example.com"),
+        ).resolves.toBeUndefined();
+        expect(deleteFileMock).toHaveBeenCalled();
+        // Everything after the cleanup step still ran.
+        expect(ids(tables.documents)).toEqual(["d-other"]);
+        expect(ids(tables.projects)).toEqual(["p-other"]);
     });
 
     it("treats document/workflow prefix cleanup as best-effort", async () => {

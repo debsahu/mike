@@ -29,7 +29,9 @@ export function getModelProvider(modelId: string): ModelProvider | null {
 export function isModelAvailable(
     modelId: string,
     apiKeys: ApiKeyState,
+    configuredModelIds: readonly string[] = [],
 ): boolean {
+    if (configuredModelIds.includes(modelId)) return true;
     const provider = getModelProvider(modelId);
     if (!provider) return false;
     return isProviderAvailable(provider, apiKeys);

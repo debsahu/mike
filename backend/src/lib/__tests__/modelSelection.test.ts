@@ -1,11 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+    hasApiKeyForModel,
     normalizeOptionalModelPreference,
     resolveEffectiveChatModel,
     resolveEffectiveReasoningLevel,
     titleModelForChat,
 } from "../modelSelection";
-import type { createServerSupabase } from "../supabase";
+import { resetModelRegistryCache } from "../llm/registry";
+import type { Db } from "../supabase";
 
 const routerModels = {
     openrouter: ["anthropic/claude-sonnet-4.5"],
@@ -83,7 +85,7 @@ describe("resolveEffectiveReasoningLevel", () => {
 });
 
 describe("resolveEffectiveChatModel", () => {
-    const db = {} as ReturnType<typeof createServerSupabase>;
+    const db = {} as Db;
 
     it("uses an explicit request before persisted values", async () => {
         await expect(
@@ -129,5 +131,56 @@ describe("resolveEffectiveChatModel", () => {
             ok: false,
             code: "model_required",
         });
+    });
+});
+
+describe("configured model selection", () => {
+    const originalConfig = process.env.MIKE_MODEL_CONFIG_JSON;
+
+    beforeEach(() => {
+        process.env.MIKE_MODEL_CONFIG_JSON = JSON.stringify({
+            models: [
+                {
+                    id: "keyless-compatible",
+                    provider: "openai-compatible",
+                    location: "cloud",
+                    baseUrl: "https://models.example.test/v1",
+                },
+                {
+                    id: "user-key-compatible",
+                    provider: "openai-compatible",
+                    location: "cloud",
+                    baseUrl: "https://models.example.test/v1",
+                    apiKeyProvider: "openai",
+                },
+            ],
+        });
+        resetModelRegistryCache();
+    });
+
+    afterEach(() => {
+        if (originalConfig === undefined) {
+            delete process.env.MIKE_MODEL_CONFIG_JSON;
+        } else {
+            process.env.MIKE_MODEL_CONFIG_JSON = originalConfig;
+        }
+        resetModelRegistryCache();
+    });
+
+    it("allows a keyless configured model", () => {
+        expect(hasApiKeyForModel("keyless-compatible", {})).toBe(true);
+    });
+
+    it("requires a declared user key", () => {
+        expect(hasApiKeyForModel("user-key-compatible", {})).toBe(false);
+        expect(
+            hasApiKeyForModel("user-key-compatible", { openai: "user-key" }),
+        ).toBe(true);
+    });
+
+    it("reuses the configured chat model for title generation", () => {
+        expect(titleModelForChat("keyless-compatible")).toBe(
+            "keyless-compatible",
+        );
     });
 });

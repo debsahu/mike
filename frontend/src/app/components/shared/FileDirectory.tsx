@@ -13,7 +13,7 @@ import type { Document, LibraryFolder, Project } from "./types";
 import { FileTypeIcon } from "./FileTypeIcon";
 import { ProjectSvgIcon, SubfolderSvgIcon } from "./FolderSvgIcon";
 import { SearchBar } from "@/app/components/ui/search-bar";
-import { TabPillButton } from "@/app/components/ui/tab-pill-button";
+import { TabPillButtonUI } from "@/shared/ui/TabPillButtonUI";
 import { SkeletonLine } from "./TablePrimitive";
 import { TableLoadMoreRow } from "./TableLoadMoreRow";
 import { useDirectoryData, type DirectoryTab } from "./useDirectoryData";
@@ -148,6 +148,10 @@ interface FileDirectoryProps {
   /** Documents already attached to the target resource. They remain visible
    * and checked, but cannot be toggled again. */
   disabledDocumentIds?: ReadonlySet<string>;
+  /** Freezes the whole selection: rows and folder select-alls still show what
+   * is picked, but nothing can be added or removed. For callers whose target
+   * has stopped accepting a changed document set. */
+  selectionDisabled?: boolean;
 }
 
 export function FileDirectory({
@@ -172,6 +176,7 @@ export function FileDirectory({
   loadingMoreRootDocuments = false,
   onLoadMoreRootDocuments,
   disabledDocumentIds,
+  selectionDisabled = false,
 }: FileDirectoryProps) {
   const autoLoadTriggeredRef = useRef(false);
     const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
@@ -480,7 +485,7 @@ export function FileDirectory({
   }
 
     function toggle(doc: Document) {
-        if (disabledDocumentIds?.has(doc.id)) return;
+        if (selectionDisabled || disabledDocumentIds?.has(doc.id)) return;
 
         const next = new Map(
             selectedDocuments.map((document) => [document.id, document]),
@@ -508,6 +513,7 @@ export function FileDirectory({
     }
 
     function toggleDocuments(docs: Document[]) {
+        if (selectionDisabled) return;
         const selectableDocs = docs.filter(
             (doc) => !disabledDocumentIds?.has(doc.id),
         );
@@ -620,7 +626,8 @@ export function FileDirectory({
 
     function renderDocumentRow(doc: Document, depth = 0) {
         const selected = checkedIds.has(doc.id);
-        const disabled = disabledDocumentIds?.has(doc.id) ?? false;
+        const disabled =
+            selectionDisabled || (disabledDocumentIds?.has(doc.id) ?? false);
         return (
             <label
                 key={doc.id}
@@ -692,6 +699,7 @@ export function FileDirectory({
                             checked={allSelected}
                             indeterminate={someSelected}
                             disabled={
+                                selectionDisabled ||
                                 !folderSelectionReady ||
                                 docsInFolder.length === 0
                             }
@@ -1129,6 +1137,7 @@ export function FileDirectory({
                                                 someProjectDocsSelected
                                             }
                                             disabled={
+                                                selectionDisabled ||
                                                 !projectSelectionReady ||
                                                 docs.length === 0
                                             }
@@ -1312,13 +1321,13 @@ function FileDirectoryControls({
                     {tabs.map((tab) => {
                         const active = activeTab === tab.value;
                         return (
-                            <TabPillButton
+                            <TabPillButtonUI
                                 key={tab.value}
                                 active={active}
                                 onClick={() => onChange(tab.value)}
                             >
                                 {tab.label}
-                            </TabPillButton>
+                            </TabPillButtonUI>
                         );
                     })}
                 </div>

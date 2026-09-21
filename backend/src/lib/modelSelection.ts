@@ -12,11 +12,16 @@ import {
     type ReasoningLevel,
 } from "./llm";
 import {
+    apiKeyForConfiguredModel,
+    configuredModelRequiresApiKey,
+    getConfiguredModel,
+} from "./llm/registry";
+import {
     isRouterModelSelected,
     type RouterModelSelections,
 } from "./routerModels";
 import { resolveRequestedModel } from "./routerModels";
-import { createServerSupabase } from "./supabase";
+import type { Db } from "./supabase";
 import { UserFacingError } from "./userFacingError";
 
 export const MODEL_REQUIRED_DETAIL =
@@ -78,8 +83,18 @@ export function hasApiKeyForModel(
     apiKeys: UserApiKeys,
 ): boolean {
     const provider = providerForModel(model);
+    if (provider === "ollama") return true;
+    // Keyless, but only while the operator has turned the local CLI on.
     if (provider === "claude-code") return isClaudeCodeEnabled();
-    return provider === "ollama" || !!apiKeys[provider]?.trim();
+    if (provider === "openai-compatible") {
+        const configured = getConfiguredModel(model);
+        return (
+            configured !== null &&
+            (!configuredModelRequiresApiKey(configured) ||
+                apiKeyForConfiguredModel(configured, apiKeys) !== null)
+        );
+    }
+    return !!apiKeys[provider]?.trim();
 }
 
 type EffectiveChatModelResult =
@@ -106,7 +121,7 @@ export async function resolveEffectiveChatModel(args: {
     lastSelectedModel?: string | null;
     apiKeys: UserApiKeys;
     userId: string;
-    db: ReturnType<typeof createServerSupabase>;
+    db: Db;
 }): Promise<EffectiveChatModelResult> {
     const requestedText = args.requested?.trim() ?? "";
     if (requestedText) {
@@ -209,6 +224,7 @@ export function titleModelForChat(
         case "vercel":
         case "opencode-go":
         case "ollama":
+        case "openai-compatible":
             return resolvedChatModel;
     }
 }

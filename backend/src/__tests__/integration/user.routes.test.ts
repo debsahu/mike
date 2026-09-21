@@ -21,6 +21,7 @@ const {
     deleteUserPrivateMemories,
     deleteUserAccountData,
     deleteUserProjects,
+    listOrgsBlockingAccountDeletion,
     buildUserAccountExport,
     buildUserChatsExport,
     buildUserTabularReviewsExport,
@@ -39,6 +40,7 @@ const {
     deleteUserPrivateMemories: vi.fn(),
     deleteUserAccountData: vi.fn(),
     deleteUserProjects: vi.fn(),
+    listOrgsBlockingAccountDeletion: vi.fn(),
     buildUserAccountExport: vi.fn(),
     buildUserChatsExport: vi.fn(),
     buildUserTabularReviewsExport: vi.fn(),
@@ -63,6 +65,13 @@ let supabaseState: {
     tables: Record<string, QueryResult | QueryResult[]>;
     updates: Record<string, unknown[]>;
     inserts: Record<string, unknown[]>;
+    // Every column list a route asked for, per table, in order. The
+    // deploy-before-migrate cascade is only correct if each retry tier drops
+    // the columns its tier is missing, which is invisible from the result.
+    selects: Record<string, string[]>;
+    // Columns a pre-migration database does not have: any select naming one
+    // fails with 42703, exactly as Postgres would, however many tiers ask.
+    missingColumns: string[];
     adminGetUserById: QueryResult;
     adminDeleteUser: { error: unknown };
 };
@@ -72,6 +81,8 @@ function resetSupabaseState() {
         tables: {},
         updates: {},
         inserts: {},
+        selects: {},
+        missingColumns: [],
         adminGetUserById: {
             data: { user: { id: "u1", factors: [] } },
             error: null,
@@ -116,6 +127,27 @@ function makeQuery(table: string) {
         "contains",
     ];
     for (const m of chain) q[m] = vi.fn(() => q);
+    let missing: string | null = null;
+    q.select = vi.fn((columns?: unknown) => {
+        if (typeof columns === "string") {
+            (supabaseState.selects[table] ??= []).push(columns);
+            missing =
+                supabaseState.missingColumns.find((column) =>
+                    columns.split(/,\s*/).includes(column),
+                ) ?? null;
+        }
+        return q;
+    });
+    const missingColumnResult = (): QueryResult | null =>
+        missing
+            ? {
+                  data: null,
+                  error: {
+                      code: "42703",
+                      message: `column user_profiles.${missing} does not exist`,
+                  },
+              }
+            : null;
     // Record update payloads so tests can assert what a route WROTE (the
     // per-table result stub only models what queries return).
     q.update = vi.fn((payload: unknown) => {
@@ -126,12 +158,20 @@ function makeQuery(table: string) {
         (supabaseState.inserts[table] ??= []).push(payload);
         return q;
     });
-    q.single = vi.fn(() => Promise.resolve(resultForTable(table)));
-    q.maybeSingle = vi.fn(() => Promise.resolve(resultForTable(table)));
+    q.single = vi.fn(() =>
+        Promise.resolve(missingColumnResult() ?? resultForTable(table)),
+    );
+    q.maybeSingle = vi.fn(() =>
+        Promise.resolve(missingColumnResult() ?? resultForTable(table)),
+    );
     q.then = (
         resolve: (v: unknown) => unknown,
         reject?: (e: unknown) => unknown,
-    ) => Promise.resolve(resultForTable(table)).then(resolve, reject);
+    ) =>
+        Promise.resolve(missingColumnResult() ?? resultForTable(table)).then(
+            resolve,
+            reject,
+        );
     return q;
 }
 
@@ -186,7 +226,7 @@ vi.mock("../../middleware/auth", () => ({
 // (which encrypts) and never echo plaintext — getUserApiKeyStatus returns
 // presence-only booleans. getUserApiKeys must be exported too — lib/userSettings
 // imports it at module load.
-vi.mock("../../lib/userApiKeys", () => ({
+vi.mock("../../modules/user/user.apiKeyStore", () => ({
     getUserApiKeyStatus: (...args: unknown[]) => getUserApiKeyStatus(...args),
     saveUserApiKey: (...args: unknown[]) => saveUserApiKey(...args),
     hasEnvApiKey: (...args: unknown[]) => hasEnvApiKey(...args),
@@ -195,13 +235,15 @@ vi.mock("../../lib/userApiKeys", () => ({
     getUserApiKeys: vi.fn(async () => ({})),
 }));
 
-vi.mock("../../lib/userDataCleanup", () => ({
+vi.mock("../../modules/user/user.dataCleanup", () => ({
     deleteAllUserChats: (...args: unknown[]) => deleteAllUserChats(...args),
     deleteAllUserTabularReviews: (...args: unknown[]) =>
         deleteAllUserTabularReviews(...args),
     deleteUserAccountData: (...args: unknown[]) =>
         deleteUserAccountData(...args),
     deleteUserProjects: (...args: unknown[]) => deleteUserProjects(...args),
+    listOrgsBlockingAccountDeletion: (...args: unknown[]) =>
+        listOrgsBlockingAccountDeletion(...args),
 }));
 
 vi.mock("../../lib/memory/bulk", () => ({
@@ -209,7 +251,7 @@ vi.mock("../../lib/memory/bulk", () => ({
         deleteUserPrivateMemories(...args),
 }));
 
-vi.mock("../../lib/userDataExport", () => ({
+vi.mock("../../modules/user/user.dataExport", () => ({
     buildUserAccountExport: (...args: unknown[]) =>
         buildUserAccountExport(...args),
     buildUserChatsExport: (...args: unknown[]) => buildUserChatsExport(...args),
@@ -287,6 +329,7 @@ describe("user.routes", () => {
         deleteUserPrivateMemories.mockResolvedValue(undefined);
         deleteUserAccountData.mockResolvedValue(undefined);
         deleteUserProjects.mockResolvedValue(undefined);
+        listOrgsBlockingAccountDeletion.mockResolvedValue([]);
         buildUserAccountExport.mockResolvedValue({ account: "data" });
         buildUserChatsExport.mockResolvedValue({ chats: "data" });
         buildUserTabularReviewsExport.mockResolvedValue({ reviews: "data" });
@@ -381,6 +424,46 @@ describe("user.routes", () => {
             expect(res.body.titleModel).toBe("gpt-5.4-mini");
             expect(res.body.memoryCuratorModel).toBeNull();
             expect(res.body.projectMemoryDefault).toBe(true);
+        });
+
+        it("drops project_memory_default from the retry, not just memory_curator_model", async () => {
+            // Both columns arrive in the SAME migration (#451). A database
+            // that has the new code but not the migration rejects every select
+            // naming either one. A retry tier that still names
+            // project_memory_default therefore fails with the identical 42703
+            // and the cascade falls further than it should, dropping
+            // preference columns the database actually has.
+            const preMigrationRow = profileRow({ title_model: "gpt-5.4-mini" });
+            delete (preMigrationRow as Record<string, unknown>)
+                .memory_curator_model;
+            delete (preMigrationRow as Record<string, unknown>)
+                .project_memory_default;
+            supabaseState.missingColumns = [
+                "memory_curator_model",
+                "project_memory_default",
+            ];
+            supabaseState.tables.user_profiles = {
+                data: preMigrationRow,
+                error: null,
+            };
+
+            const res = await request(app)
+                .get("/user/profile")
+                .set(...AUTH);
+
+            expect(res.status).toBe(200);
+            const selects = supabaseState.selects.user_profiles ?? [];
+            // Exactly one retry: the full select, then the tier that drops
+            // both columns of that migration and nothing else.
+            expect(selects).toHaveLength(2);
+            expect(selects[0]).toContain("project_memory_default");
+            expect(selects[1]).not.toContain("project_memory_default");
+            expect(selects[1]).not.toContain("memory_curator_model");
+            // The tier keeps every other preference the database does have.
+            expect(selects[1]).toContain("last_selected_reasoning_level");
+            expect(selects[1]).toContain("dark_mode");
+            expect(res.body.titleModel).toBe("gpt-5.4-mini");
+            expect(res.body.memoryCuratorModel).toBeNull();
         });
 
         it("keeps saved preferences on a database without the onboarding migration", async () => {
@@ -622,7 +705,7 @@ describe("user.routes", () => {
             expect(saveUserApiKey).not.toHaveBeenCalled();
         });
 
-        it("returns 409 when the provider is configured by the server env", async () => {
+        it("stores a user key when the provider is also configured by the server env", async () => {
             hasEnvApiKey.mockReturnValue(true);
 
             const res = await request(app)
@@ -630,8 +713,13 @@ describe("user.routes", () => {
                 .set(...AUTH)
                 .send({ api_key: "sk-x" });
 
-            expect(res.status).toBe(409);
-            expect(saveUserApiKey).not.toHaveBeenCalled();
+            expect(res.status).toBe(200);
+            expect(saveUserApiKey).toHaveBeenCalledWith(
+                "u1",
+                "claude",
+                "sk-x",
+                expect.anything(),
+            );
         });
 
         it("returns 500 when saving the key throws", async () => {
@@ -1127,6 +1215,54 @@ describe("user.routes", () => {
             // Sessions are revoked immediately all the same: the account is
             // unusable from the moment this returns.
             expect(adminSignOut).toHaveBeenCalledWith("test-token", "global");
+        });
+
+        // SOLE-ADMIN REFUSAL. Deleting this account would either hand the
+        // organization to an arbitrary successor or strand it with no members
+        // at all, so the product refuses and names the organizations.
+        it("DELETE /user/account returns 409 for the sole admin of a live org", async () => {
+            listOrgsBlockingAccountDeletion.mockResolvedValue([
+                { org_id: "o1", name: "Org A", reason: "members" },
+                { org_id: "o2", name: "Org B", reason: "content" },
+            ]);
+
+            const res = await request(app)
+                .delete("/user/account")
+                .set(...AUTH);
+
+            expect(res.status).toBe(409);
+            expect(res.body.code).toBe("org_successor_required");
+            expect(res.body.detail).toBe(
+                "You are the only admin of Org A. Make another member an admin, or delete the organization, before deleting your account. You are the only admin of Org B, which still owns content. Delete or move the organization's projects, workflows, documents and reviews, or delete the organization, before deleting your account.",
+            );
+            expect(res.body.organizations).toEqual([
+                { org_id: "o1", name: "Org A", reason: "members" },
+                { org_id: "o2", name: "Org B", reason: "content" },
+            ]);
+            // Nothing was scheduled, nothing was revoked, nothing was
+            // destroyed — the user is still signed in and can appoint an
+            // admin. The old behaviour answered 204, revoked the session and
+            // then failed the job forever.
+            expect(supabaseState.inserts.db_jobs ?? []).toHaveLength(0);
+            expect(adminSignOut).not.toHaveBeenCalled();
+            expect(deleteUserAccountData).not.toHaveBeenCalled();
+        });
+
+        it("DELETE /user/account refuses the inline path for a sole admin too", async () => {
+            // The no-runner fallback runs the cascade synchronously, so the
+            // check must gate it as well.
+            dbJobsEnabled.mockReturnValue(false);
+            listOrgsBlockingAccountDeletion.mockResolvedValue([
+                { org_id: "o1", name: "Org A", reason: "members" },
+            ]);
+
+            const res = await request(app)
+                .delete("/user/account")
+                .set(...AUTH);
+
+            expect(res.status).toBe(409);
+            expect(deleteUserAccountData).not.toHaveBeenCalled();
+            expect(adminDeleteUser).not.toHaveBeenCalled();
         });
 
         it("DELETE /user/account runs inline when no runner will drain the queue", async () => {

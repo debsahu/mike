@@ -156,22 +156,17 @@ vi.mock("../../lib/supabase", () => ({
     createServerSupabase: vi.fn(() => mockSupabase()),
 }));
 
-vi.mock("../../middleware/auth", () => ({
-    requireAuth: (
-        _req: unknown,
-        res: { locals: Record<string, unknown> },
-        next: () => void,
-    ) => {
-        res.locals.userId = "u1";
-        res.locals.userEmail = "u1@test.local";
-        next();
-    },
-    requireMfaIfEnrolled: (_req: unknown, _res: unknown, next: () => void) =>
-        next(),
-}));
+// The auth stub is the one in ../helpers/authMock, shared with the other route
+// suites. The Supabase stub below is NOT: this suite needs per-table result
+// QUEUES, an update recorder, and the tabular_reviews model default, none of
+// which the shared one carries.
+vi.mock("../../middleware/auth", async () => {
+    const { authMock } = await import("../helpers/authMock.js");
+    return authMock();
+});
 
-vi.mock("../../lib/chat", async (importOriginal) => ({
-    ...(await importOriginal<typeof import("../../lib/chat")>()),
+vi.mock("../../modules/chat/engine/index", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../../modules/chat/engine/index")>()),
     runLLMStream: (...args: unknown[]) => runLLMStream(...args),
 }));
 
@@ -196,7 +191,7 @@ vi.mock("../../lib/access", async (importOriginal) => ({
     resolveContentOrgId: (...args: unknown[]) => resolveContentOrgId(...args),
 }));
 
-vi.mock("../../lib/userSettings", () => ({
+vi.mock("../../modules/user/user.settings", () => ({
     getUserModelSettings: (...args: unknown[]) => getUserModelSettings(...args),
     getUserApiKeys: vi.fn(async () => ({})),
     persistLastSelectedChatModel: vi.fn(async () => null),
@@ -211,6 +206,7 @@ vi.mock("../../lib/documentVersions", () => ({
 }));
 
 import { app } from "../../app";
+import { REVIEW_EDIT_FORBIDDEN } from "../../modules/tabular/tabular.service";
 
 const AUTH = ["Authorization", "Bearer test"] as const;
 
@@ -1449,6 +1445,123 @@ describe("tabular.routes", () => {
             expect(res.body.detail).toBe("Review not found");
         });
 
+        // ── the write gate ────────────────────────────────────────────────
+        // GENERATION IS A WRITE: it claims the review's generation lease,
+        // spends the caller's model credit, persists a cell per column per
+        // row and stamps an audit event in the caller's name. `access.ok`
+        // alone let a review VIEWER do all of that.
+        it("refuses a viewer with 403, not 404, and starts nothing", async () => {
+            supabaseState.tables.tabular_reviews = {
+                data: {
+                    id: "r1",
+                    user_id: "other",
+                    project_id: "p1",
+                    columns_config: [{ index: 0, name: "Col", prompt: "p" }],
+                },
+                error: null,
+            };
+            ensureReviewAccess.mockResolvedValue({
+                ok: true,
+                isCreator: false,
+                orgRole: "member",
+                projectRole: "viewer",
+            });
+
+            const res = await request(app)
+                .post("/tabular-review/r1/generate")
+                .set(...AUTH)
+                .send({ expected_updated_at: new Date().toISOString() });
+
+            // 403 with a reason, because the viewer CAN see this review —
+            // telling them it does not exist is a lie the UI then repeats.
+            expect(res.status).toBe(403);
+            expect(res.body.detail).toBe(REVIEW_EDIT_FORBIDDEN);
+            // And no side effects: no generation lease, no cells, no audit.
+            expect(supabaseState.rpcCalls).toEqual([]);
+            expect(supabaseState.inserts).toEqual([]);
+            expect(supabaseState.updates).toEqual([]);
+        });
+
+        it("lets an editor past the gate", async () => {
+            // Empty columns_config, so the next guard in prepareTabularGenerate
+            // answers — which is how the test proves the WRITE gate was
+            // passed without entering the streaming loop.
+            supabaseState.tables.tabular_reviews = {
+                data: {
+                    id: "r1",
+                    user_id: "other",
+                    project_id: "p1",
+                    columns_config: [],
+                },
+                error: null,
+            };
+            ensureReviewAccess.mockResolvedValue({
+                ok: true,
+                isCreator: false,
+                orgRole: "member",
+                projectRole: "editor",
+            });
+
+            const res = await request(app)
+                .post("/tabular-review/r1/generate")
+                .set(...AUTH);
+
+            expect(res.status).toBe(400);
+            expect(res.body.detail).toBe("No columns configured");
+        });
+
+        it("still answers 404 to a caller with no verdict at all", async () => {
+            // The split must keep the 404 for a non-member: 403 would confirm
+            // the review exists to somebody who cannot see it.
+            supabaseState.tables.tabular_reviews = {
+                data: {
+                    id: "r1",
+                    user_id: "other",
+                    project_id: "p1",
+                    columns_config: [{ index: 0, name: "Col", prompt: "p" }],
+                },
+                error: null,
+            };
+            ensureReviewAccess.mockResolvedValue({ ok: false });
+
+            const res = await request(app)
+                .post("/tabular-review/r1/generate")
+                .set(...AUTH);
+
+            expect(res.status).toBe(404);
+            expect(res.body.detail).toBe("Review not found");
+        });
+
+        it("refuses a viewer on the reconnect stream as well", async () => {
+            // The reconnect stream resumes a run this caller was entitled to
+            // START, and a viewer never was. Leaving it open would have made
+            // the POST gate cosmetic: the same generation channel, one URL
+            // away.
+            supabaseState.tables.tabular_reviews = {
+                data: {
+                    id: "r1",
+                    user_id: "other",
+                    project_id: "p1",
+                    columns_config: [{ index: 0, name: "Col", prompt: "p" }],
+                },
+                error: null,
+            };
+            ensureReviewAccess.mockResolvedValue({
+                ok: true,
+                isCreator: false,
+                orgRole: "member",
+                projectRole: "viewer",
+            });
+
+            const res = await request(app)
+                .get("/tabular-review/r1/generate/stream")
+                .set(...AUTH);
+
+            expect(res.status).toBe(403);
+            expect(res.body.detail).toBe(REVIEW_EDIT_FORBIDDEN);
+            expect(supabaseState.rpcCalls).toEqual([]);
+        });
+
         it("blocks a run when the review has no selected model", async () => {
             supabaseState.tables.tabular_reviews = {
                 data: {
@@ -1667,6 +1780,31 @@ describe("tabular.routes", () => {
 
             expect(res.status).toBe(404);
             expect(res.body.detail).toBe("Review not found");
+        });
+
+        it("refuses a viewer with 403 rather than claiming the review is gone", async () => {
+            // Review chat writes: it persists messages and can reshape the
+            // review. A viewer used to be told "Review not found" for a
+            // review sitting open on their screen.
+            supabaseState.tables.tabular_reviews = {
+                data: { id: "r1", user_id: "other", project_id: "p1" },
+                error: null,
+            };
+            ensureReviewAccess.mockResolvedValue({
+                ok: true,
+                isCreator: false,
+                orgRole: "member",
+                projectRole: "viewer",
+            });
+
+            const res = await request(app)
+                .post("/tabular-review/r1/chat")
+                .set(...AUTH)
+                .send({ messages: [{ role: "user", content: "hello" }] });
+
+            expect(res.status).toBe(403);
+            expect(res.body.detail).toBe(REVIEW_EDIT_FORBIDDEN);
+            expect(supabaseState.inserts).toEqual([]);
         });
 
         it("returns 422 missing_api_key before streaming when the key is absent", async () => {

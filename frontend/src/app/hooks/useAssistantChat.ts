@@ -1,9 +1,29 @@
 "use client";
 
-import { useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import { useRouter } from "next/navigation";
 import { streamChat, streamProjectChat } from "@/app/lib/mikeApi";
+import {
+  beginAssistantTurn,
+  cancelAssistantTurn,
+  getAssistantTurn,
+  hasAssistantTurn,
+  subscribeAssistantTurns,
+  withLiveTurn,
+  type AssistantTurnHandle,
+  type LiveAssistantTurn,
+} from "@/app/lib/assistantTurns";
 import { assistantHistoryContent } from "@/app/lib/assistantHistoryContent";
+import { readSseFrames } from "@/app/lib/sse";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
 import { isPanelDocument } from "@/app/components/shared/types";
 import type {
@@ -16,6 +36,8 @@ interface UseAssistantChatOptions {
   initialMessages?: Message[];
   chatId?: string;
   projectId?: string;
+  /** Adopts the server id as soon as it arrives, without navigation. */
+  onChatCreated?: (chatId: string) => void;
 }
 
 function readableStreamError(value: unknown, safeToDisplay: boolean): string {
@@ -67,43 +89,23 @@ function parseCourtlistenerCaseSearches(value: unknown) {
     .filter((item): item is NonNullable<typeof item> => !!item);
 }
 
-export function useAssistantChat({
-  initialMessages = [],
-  chatId: initialChatId,
-  projectId,
-}: UseAssistantChatOptions = {}) {
-  const router = useRouter();
-  const {
-    replaceChatId,
-    loadChats,
-    setCurrentChatId,
-    saveChat,
-    setNewChatMessages,
-    updateChatTitle,
-  } = useChatHistoryContext();
-
-  const [messages, setMessages] = useState<Message[]>(initialMessages);
-  const [isResponseLoading, setIsResponseLoading] = useState(false);
-  const [isLoadingCitations, setIsLoadingCitations] = useState(false);
-  const [chatId, setChatId] = useState<string | undefined>(initialChatId);
-
-  const abortControllerRef = useRef<AbortController | null>(null);
-
-  const eventsRef = useRef<AssistantEvent[]>([]);
-
-  const updateLatestAssistantMessage = (
-    updater: (message: Message) => Message,
-  ) => {
-    setMessages((prev) => {
-      const assistantIndex = [...prev]
-        .map((message, index) => ({ message, index }))
-        .reverse()
-        .find(({ message }) => message.role === "assistant")?.index;
-      if (assistantIndex === undefined) return prev;
-      const updated = [...prev];
-      updated[assistantIndex] = updater(updated[assistantIndex]);
-      return updated;
-    });
+/**
+ * Builds one turn's assistant message from its stream.
+ *
+ * Everything here writes to the turn record, never to a hook's state. The
+ * hook that sent the request may have moved to another thread or unmounted
+ * by the time a frame arrives, and a hook that has come back to the thread
+ * renders the same record — so the record is the one place the answer lives
+ * while it streams.
+ */
+function createTurnEventSink(
+  turn: AssistantTurnHandle,
+  initialEvents: AssistantEvent[],
+) {
+  const eventsRef = { current: initialEvents };
+  const publish = () => {
+    const snapshot = [...eventsRef.current];
+    turn.update((message) => ({ ...message, events: snapshot }));
   };
 
   /**
@@ -121,11 +123,7 @@ export function useAssistantChat({
         ...events.slice(0, -1),
         { type: "content", text: last.text },
       ];
-      const snapshot = [...eventsRef.current];
-      updateLatestAssistantMessage((message) => ({
-        ...message,
-        events: snapshot,
-      }));
+      publish();
     }
   };
 
@@ -140,11 +138,7 @@ export function useAssistantChat({
       ...events.slice(0, -1),
       { type: "reasoning", text: last.text },
     ];
-    const snapshot = [...eventsRef.current];
-    updateLatestAssistantMessage((message) => ({
-      ...message,
-      events: snapshot,
-    }));
+    publish();
   };
 
   // Transient placeholder events (tool_call_start, thinking) fill the
@@ -163,26 +157,17 @@ export function useAssistantChat({
         return rest as AssistantEvent;
       });
 
-  const appendCancellationEvent = (events: AssistantEvent[]) => {
-    const cancelledEvents = cancelStreamingEvents(events);
-    return [
-      ...cancelledEvents,
+  // Stop may reach the record twice: from the control itself and from the
+  // aborted request unwinding. The label goes on once.
+  let cancelled = false;
+  const appendCancellation = () => {
+    if (cancelled) return;
+    cancelled = true;
+    eventsRef.current = [
+      ...cancelStreamingEvents(eventsRef.current),
       { type: "content" as const, text: "Cancelled by user." },
     ];
-  };
-
-  const cancel = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      const snapshot = cancelStreamingEvents(eventsRef.current);
-      eventsRef.current = snapshot;
-      updateLatestAssistantMessage((message) => ({
-        ...message,
-        events: cancelStreamingEvents(message.events ?? snapshot),
-      }));
-      setIsResponseLoading(false);
-      setIsLoadingCitations(false);
-    }
+    publish();
   };
 
   const clearStreamingPlaceholders = () => {
@@ -190,11 +175,7 @@ export function useAssistantChat({
     const after = before.filter((e) => !isStreamingPlaceholder(e));
     if (after.length === before.length) return;
     eventsRef.current = after;
-    const snapshot = [...after];
-    updateLatestAssistantMessage((message) => ({
-      ...message,
-      events: snapshot,
-    }));
+    publish();
   };
 
   const pushThinkingPlaceholder = () => {
@@ -206,11 +187,7 @@ export function useAssistantChat({
       ...events,
       { type: "thinking" as const, isStreaming: true },
     ];
-    const snapshot = [...eventsRef.current];
-    updateLatestAssistantMessage((message) => ({
-      ...message,
-      events: snapshot,
-    }));
+    publish();
   };
 
   const pushEvent = (event: AssistantEvent) => {
@@ -220,11 +197,7 @@ export function useAssistantChat({
     // tool_call_start, should replace any generic "Thinking..." line.
     const next = eventsRef.current.filter((e) => !isStreamingPlaceholder(e));
     eventsRef.current = [...next, event];
-    const snapshot = [...eventsRef.current];
-    updateLatestAssistantMessage((message) => ({
-      ...message,
-      events: snapshot,
-    }));
+    publish();
   };
 
   const updateMatchingEvent = (
@@ -240,12 +213,180 @@ export function useAssistantChat({
     const newEvents = [...events];
     newEvents[idx] = updater(events[idx]);
     eventsRef.current = newEvents;
-    const snapshot = [...newEvents];
-    updateLatestAssistantMessage((message) => ({
-      ...message,
-      events: snapshot,
-    }));
+    publish();
     return true;
+  };
+
+  return {
+    eventsRef,
+    finalizeStreamingContent,
+    finalizeStreamingReasoning,
+    clearStreamingPlaceholders,
+    pushThinkingPlaceholder,
+    pushEvent,
+    updateMatchingEvent,
+    appendCancellation,
+  };
+}
+
+export function useAssistantChat({
+  initialMessages = [],
+  chatId: initialChatId,
+  projectId,
+  onChatCreated,
+}: UseAssistantChatOptions = {}) {
+  const router = useRouter();
+  const {
+    replaceChatId,
+    loadChats,
+    setCurrentChatId,
+    saveChat,
+    setNewChatMessages,
+    updateChatTitle,
+  } = useChatHistoryContext();
+
+  const [messages, setRawMessages] = useState<Message[]>(initialMessages);
+  const [isResponseLoading, setIsResponseLoading] = useState(false);
+  // An object, not a bare model id: an ask-inputs response submits without a
+  // model, and a null id has to still open the popup — the id only decides
+  // whether the provider can be named.
+  const [rejectedApiKey, setRejectedApiKey] = useState<{
+    model: string | null;
+  } | null>(null);
+  const [isLoadingCitations, setIsLoadingCitations] = useState(false);
+  const [chatId, setChatId] = useState<string | undefined>(initialChatId);
+
+  useEffect(() => {
+    setChatId(initialChatId);
+  }, [initialChatId]);
+
+  const mountedRef = useRef(true);
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const viewedChatId = initialChatId ?? chatId;
+  const pendingTurn = useSyncExternalStore(
+    subscribeAssistantTurns,
+    () => hasAssistantTurn(viewedChatId),
+    () => false,
+  );
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const registeredTurnRef = useRef<AssistantTurnHandle | null>(null);
+  const requestGenerationRef = useRef(0);
+
+  // The turn this hook renders. While it streams, every change to its
+  // assistant message is mirrored into `messages`; whichever hook is looking
+  // at the thread — the one that sent the request, or one that came back to
+  // it — shows the same live answer. Once the turn has finished the record
+  // stays attached until the thread changes, so a history read that started
+  // before the answer was stored cannot erase it from the screen.
+  const attachedTurnRef = useRef<LiveAssistantTurn | null>(null);
+  const unsubscribeTurnRef = useRef<(() => void) | null>(null);
+  const attachToTurn = useCallback((live: LiveAssistantTurn | null) => {
+    if (live === attachedTurnRef.current) return;
+    unsubscribeTurnRef.current?.();
+    unsubscribeTurnRef.current = null;
+    attachedTurnRef.current = live;
+    if (!live) return;
+    const mirror = () => {
+      setRawMessages((prev) => withLiveTurn(prev, live));
+      setIsLoadingCitations(live.loadingCitations);
+      if (live.finished) {
+        unsubscribeTurnRef.current?.();
+        unsubscribeTurnRef.current = null;
+      }
+    };
+    unsubscribeTurnRef.current = live.subscribe(mirror);
+    mirror();
+  }, []);
+  // Hosts replace the transcript when a thread's history arrives. The turn
+  // in flight is laid over whatever they set, so the answer streaming into
+  // this thread is never displaced by a snapshot taken before it was stored.
+  const setMessages: Dispatch<SetStateAction<Message[]>> = useCallback(
+    (action) => {
+      setRawMessages((prev) =>
+        withLiveTurn(
+          typeof action === "function" ? action(prev) : action,
+          attachedTurnRef.current,
+        ),
+      );
+    },
+    [],
+  );
+  useEffect(() => {
+    const sync = () => {
+      const live = getAssistantTurn(viewedChatId);
+      if (live) attachToTurn(live);
+    };
+    sync();
+    const unsubscribe = subscribeAssistantTurns((id) => {
+      if (id === viewedChatId) sync();
+    });
+    return () => {
+      unsubscribe();
+      attachToTurn(null);
+    };
+  }, [viewedChatId, attachToTurn]);
+
+  // Invalidate the previous request before a new thread can receive updates.
+  //
+  // Keyed on the thread itself, never on effect lifecycle. StrictMode replays
+  // create/destroy/create on mount without the thread changing, and doing this
+  // in a cleanup aborted a request the host had just started: a first message
+  // auto-sent from a mount effect was killed mid-flight, and because the catch
+  // ignores a superseded request the turn stalled on its empty placeholder with
+  // no error. A layout effect still runs inside the switching commit, so no
+  // async continuation from the old request can land in the new thread first.
+  const threadKey = `${projectId ?? ""}:${initialChatId ?? ""}`;
+  const threadKeyRef = useRef(threadKey);
+  const adoptedThreadKeyRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (threadKeyRef.current === threadKey) return;
+    threadKeyRef.current = threadKey;
+    const isAdoptedThread = adoptedThreadKeyRef.current === threadKey;
+    adoptedThreadKeyRef.current = null;
+    // A new chat receiving its persisted id is still the same live turn.
+    if (isAdoptedThread) return;
+    // Detach — never abort. Aborting closes the socket, which the backend
+    // treats as Stop: it persists a truncated "Cancelled by user." answer in
+    // the thread the user just left. Retiring the generation is enough to
+    // keep the old turn from writing into the new thread; the request itself
+    // runs to completion and the server stores the whole answer.
+    requestGenerationRef.current += 1;
+    abortControllerRef.current = null;
+    registeredTurnRef.current = null;
+    attachToTurn(null);
+    setIsResponseLoading(false);
+    setIsLoadingCitations(false);
+  }, [threadKey, attachToTurn]);
+
+  /**
+   * Stop listening to the turn in flight without cancelling it. For leaving a
+   * thread (switching chats, starting a new one): the request keeps running,
+   * the turn record keeps collecting the answer for whoever views the thread
+   * next, and the server persists the complete answer. Only `cancel` — the
+   * Stop control — aborts the request.
+   */
+  const detach = () => {
+    requestGenerationRef.current += 1;
+    abortControllerRef.current = null;
+    registeredTurnRef.current = null;
+    attachToTurn(null);
+    setIsResponseLoading(false);
+    setIsLoadingCitations(false);
+  };
+
+  /** Stop: this hook's own request, or the detached one streaming into the thread it views. */
+  const cancel = () => {
+    const own = registeredTurnRef.current;
+    if (own) {
+      own.cancel();
+      return;
+    }
+    cancelAssistantTurn(viewedChatId);
   };
 
   const handleChat = async (
@@ -258,7 +399,7 @@ export function useAssistantChat({
       >;
     },
   ): Promise<string | null> => {
-    if (!message.content.trim()) return null;
+    if (!message.content.trim() || hasAssistantTurn(chatId)) return null;
 
     setIsResponseLoading(true);
 
@@ -302,30 +443,61 @@ export function useAssistantChat({
         })()
       : apiMessagesForTurn;
 
-    setMessages(
+    // An ask-inputs answer continues the assistant message that asked;
+    // anything else starts a fresh one.
+    const continuedAssistant = optimisticResponseEvent
+      ? ([...displayMessages]
+          .reverse()
+          .find((item) => item.role === "assistant") ?? null)
+      : null;
+    const assistantPlaceholder: Message = continuedAssistant ?? {
+      role: "assistant",
+      content: "",
+      citations: [],
+      events: [],
+    };
+    setRawMessages(
       optimisticResponseEvent
         ? displayMessages
-        : [
-            ...displayMessages,
-            {
-              role: "assistant",
-              content: "",
-              citations: [],
-              events: [],
-            },
-          ],
+        : [...displayMessages, assistantPlaceholder],
     );
 
     let streamedChatId: string | null = null;
 
-    eventsRef.current = optimisticResponseEvent
-      ? ([...displayMessages]
-          .reverse()
-          .find((item) => item.role === "assistant")?.events ?? [])
-      : [];
-
+    const generation = ++requestGenerationRef.current;
+    abortControllerRef.current?.abort();
     const controller = new AbortController();
     abortControllerRef.current = controller;
+    const isCurrentRequest = () =>
+      mountedRef.current && requestGenerationRef.current === generation;
+    // From here the turn record owns the assistant message; this hook, like
+    // any hook that comes back to the thread, renders it by attaching.
+    const turn = beginAssistantTurn(chatId, {
+      userMessage: optimisticResponseEvent ? null : message,
+      assistant: assistantPlaceholder,
+      cancel: () => {
+        controller.abort();
+        sink.appendCancellation();
+        turn.finish();
+        if (isCurrentRequest()) {
+          setIsResponseLoading(false);
+          setIsLoadingCitations(false);
+        }
+      },
+    });
+    const sink = createTurnEventSink(turn, assistantPlaceholder.events ?? []);
+    const {
+      eventsRef,
+      finalizeStreamingContent,
+      finalizeStreamingReasoning,
+      clearStreamingPlaceholders,
+      pushThinkingPlaceholder,
+      pushEvent,
+      updateMatchingEvent,
+    } = sink;
+    const updateLatestAssistantMessage = turn.update;
+    registeredTurnRef.current = turn;
+    attachToTurn(turn.turn);
 
     try {
       const apiMessages = apiMessagesForTurn.map((currentMessage) => ({
@@ -387,44 +559,42 @@ export function useAssistantChat({
         throw new Error(`Chat request failed with status ${response.status}`);
       }
 
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("No response body");
+      // One shared reader (lib/sse.ts) owns the wire format: CRLF, the
+      // decoder flush for a body that closes without a trailing newline, and
+      // [DONE]. Every frame is applied to the turn record whether or not this
+      // hook still renders the thread: the answer belongs to the thread, and
+      // whoever views it next attaches to the record. Only the hook's own
+      // state and navigation are gated on `isCurrentRequest()`.
+      //
+      // Leaving this loop early cancels the underlying reader; the backend
+      // reads the closed socket as a user cancellation (`res.on("close")` in
+      // the streaming route) and persists whatever text had arrived,
+      // labelled "Cancelled by user." So a detached turn keeps reading to
+      // the end. Stop is the one exit that still aborts: readSseFrames
+      // throws on its signal, and the socket is already closing.
+      for await (const frame of readSseFrames(response, {
+        signal: controller.signal,
+      })) {
+        const data = frame as Record<string, unknown>;
 
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          // Flush any bytes still held by TextDecoder. A response is allowed
-          // to close without a final newline, so the remaining buffer must be
-          // parsed as the last SSE record instead of being discarded.
-          buffer += decoder.decode();
-        } else {
-          buffer += decoder.decode(value, { stream: true });
-        }
-        const lines = buffer.split("\n");
-        buffer = done ? "" : lines.pop() || "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data:")) continue;
-
-          const dataStr = trimmed.slice(5).trim();
-          if (dataStr === "[DONE]") continue;
-
-          try {
-            const data = JSON.parse(dataStr);
-
+        try {
             if (data.type === "chat_id") {
-              streamedChatId = data.chatId;
-              setChatId(data.chatId);
-              setCurrentChatId(data.chatId);
-              if (typeof data.assistantMessageId === "string") {
-                updateLatestAssistantMessage((message) => ({
-                  ...message,
-                  id: data.assistantMessageId,
-                }));
+              const streamed = data.chatId as string;
+              const isNewChatId =
+                streamed !== chatId && streamed !== streamedChatId;
+              streamedChatId = streamed;
+              turn.identify(
+                streamed,
+                typeof data.assistantMessageId === "string"
+                  ? data.assistantMessageId
+                  : undefined,
+              );
+              if (!isCurrentRequest()) continue;
+              setChatId(streamed);
+              setCurrentChatId(streamed);
+              if (isNewChatId && onChatCreated) {
+                adoptedThreadKeyRef.current = `${projectId ?? ""}:${streamed}`;
+                onChatCreated(streamed);
               }
               continue;
             }
@@ -439,7 +609,7 @@ export function useAssistantChat({
             }
 
             if (data.type === "content_done") {
-              setIsLoadingCitations(true);
+              turn.setLoadingCitations(true);
               continue;
             }
 
@@ -449,6 +619,12 @@ export function useAssistantChat({
                 data.message,
                 safeToDisplay,
               );
+              // A rejected key cannot be fixed by retrying, so raise it as a
+              // signal the surface can turn into "go fix your key" rather than
+              // leaving it as one more line of failed-response text.
+              if (data.code === "invalid_api_key" && isCurrentRequest()) {
+                setRejectedApiKey({ model: model ?? null });
+              }
               clearStreamingPlaceholders();
               finalizeStreamingContent();
               finalizeStreamingReasoning();
@@ -458,6 +634,9 @@ export function useAssistantChat({
                   type: "error",
                   message,
                   ...(safeToDisplay ? { safe_to_display: true } : {}),
+                  ...(data.code === "invalid_api_key"
+                    ? { code: "invalid_api_key" as const }
+                    : {}),
                 },
               ];
               const snapshot = [...eventsRef.current];
@@ -466,8 +645,8 @@ export function useAssistantChat({
                 events: snapshot,
                 error: message,
               }));
-              setIsResponseLoading(false);
-              setIsLoadingCitations(false);
+              turn.setLoadingCitations(false);
+              if (isCurrentRequest()) setIsResponseLoading(false);
               continue;
             }
 
@@ -1298,19 +1477,14 @@ export function useAssistantChat({
               }));
               continue;
             }
-          } catch (e) {
-            console.warn(
-              "[useAssistantChat] failed to parse SSE line:",
-              trimmed,
-              e,
-            );
-          }
+        } catch (e) {
+          console.warn("[useAssistantChat] failed to handle SSE event:", data, e);
         }
-
-        if (done) break;
       }
 
       finalizeStreamingReasoning();
+      if (!isCurrentRequest()) return null;
+
       setIsResponseLoading(false);
       setIsLoadingCitations(false);
 
@@ -1324,79 +1498,39 @@ export function useAssistantChat({
           );
         }
         setCurrentChatId(finalChatId);
-        const chatBasePath = projectId
-          ? `/projects/${projectId}/assistant/chat`
-          : `/assistant/chat`;
-        router.replace(`${chatBasePath}/${finalChatId}`);
+        if (!onChatCreated) {
+          const chatBasePath = projectId
+            ? `/projects/${projectId}/assistant/chat`
+            : `/assistant/chat`;
+          router.replace(`${chatBasePath}/${finalChatId}`);
+        }
       }
 
       await loadChats();
 
       return streamedChatId || null;
     } catch (error: unknown) {
+      // The record learns of the failure even when this hook no longer
+      // renders the thread: a reader attached to the turn must see the
+      // error, not a spinner.
+      finalizeStreamingContent();
       if (error instanceof Error && error.name === "AbortError") {
-        finalizeStreamingContent();
         finalizeStreamingReasoning();
-        eventsRef.current = appendCancellationEvent(eventsRef.current);
-        setMessages((prev) => {
-          const assistantIndex = [...prev]
-            .map((message, index) => ({ message, index }))
-            .reverse()
-            .find(({ message }) => message.role === "assistant")?.index;
-          if (assistantIndex !== undefined) {
-            const assistantMessage = prev[assistantIndex];
-            const events = appendCancellationEvent(
-              assistantMessage.events ?? eventsRef.current,
-            );
-            eventsRef.current = events;
-            const updated = [...prev];
-            updated[assistantIndex] = {
-              ...assistantMessage,
-              events,
-            };
-            return updated;
-          }
-          eventsRef.current = [{ type: "content", text: "Cancelled by user." }];
-          return [
-            ...prev,
-            {
-              role: "assistant",
-              content: "",
-              events: [{ type: "content", text: "Cancelled by user." }],
-            },
-          ];
-        });
+        sink.appendCancellation();
       } else {
-        finalizeStreamingContent();
-        const errorMessage = "Sorry, something went wrong.";
-        setMessages((prev) => {
-          const assistantIndex = [...prev]
-            .map((message, index) => ({ message, index }))
-            .reverse()
-            .find(({ message }) => message.role === "assistant")?.index;
-          if (assistantIndex !== undefined) {
-            const updated = [...prev];
-            updated[assistantIndex] = {
-              ...updated[assistantIndex],
-              error: errorMessage,
-            };
-            return updated;
-          }
-          return [
-            ...prev,
-            {
-              role: "assistant",
-              content: "",
-              error: errorMessage,
-            },
-          ];
-        });
+        updateLatestAssistantMessage((message) => ({
+          ...message,
+          error: "Sorry, something went wrong.",
+        }));
       }
 
+      if (!isCurrentRequest()) return null;
       setIsResponseLoading(false);
       setIsLoadingCitations(false);
       return null;
     } finally {
+      turn.finish();
+      if (registeredTurnRef.current === turn) registeredTurnRef.current = null;
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
       }
@@ -1409,7 +1543,7 @@ export function useAssistantChat({
   ): Promise<string | null> => {
     if (!message.content.trim()) return null;
 
-    setMessages([message]);
+    setRawMessages([message]);
     setNewChatMessages([message]);
 
     const newChatId = await saveChat(projectId);
@@ -1423,13 +1557,27 @@ export function useAssistantChat({
 
   return {
     messages,
-    isResponseLoading,
+    /**
+     * Set when a provider rejected our API key on the last send. `model` is
+     * the model we asked for, or null when the send carried none. Retrying
+     * cannot help, so surfaces use this to point at the key instead.
+     */
+    rejectedApiKey,
+    dismissInvalidApiKey: () => setRejectedApiKey(null),
+    isResponseLoading: isResponseLoading || pendingTurn,
     setIsResponseLoading,
     isLoadingCitations,
     handleChat,
     handleNewChat,
     setMessages,
     cancel,
+    detach,
+    resetChat: () => {
+      detach();
+      setChatId(undefined);
+      setCurrentChatId(null);
+      setRawMessages([]);
+    },
     chatId,
   };
 }

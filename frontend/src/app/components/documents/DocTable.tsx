@@ -31,6 +31,7 @@ import {
     type UploadOutcome,
     type UploadProgress,
     type UploadProgressStatus,
+    MikeApiError,
 } from "@/app/lib/mikeApi";
 import { runUserExport } from "@/app/lib/asyncExport";
 import type {
@@ -100,7 +101,7 @@ import { DocumentSidePanel } from "@/app/components/shared/DocumentSidePanel";
 import { TableLoadMoreRow } from "@/app/components/shared/TableLoadMoreRow";
 import { LibrarySkeuoIcon } from "@/app/components/shared/AppSidebarSkeuoIcons";
 import { EmptyState } from "@/app/components/ui/empty-state";
-import { PillButton } from "@/app/components/ui/pill-button";
+import { PillButtonUI } from "@/shared/ui/PillButtonUI";
 import {
     LIQUID_GLASS_SELECTED_CLASS,
     LIQUID_GLASS_GROUP_HOVER_CLASS,
@@ -1283,8 +1284,28 @@ export function DocTable({
             !requireCapability("docs.organize", "move documents", "editor")
         )
             return;
-        setDocuments((prev) => prev.map((d) => (d.id === docId ? { ...d, folder_id: null } : d)));
-        await operations.moveDocument(docId, null);
+        setDocuments((prev) =>
+            prev.map((document) =>
+                document.id === docId
+                    ? { ...document, folder_id: null }
+                    : document,
+            ),
+        );
+        try {
+            const updated = await operations.moveDocument(docId, null);
+            setDocuments((prev) =>
+                prev.map((document) =>
+                    document.id === updated.id
+                        ? { ...document, ...updated }
+                        : document,
+                ),
+            );
+        } catch {
+            setCollectionActionWarning(
+                "The document could not be removed from its folder. Please try again.",
+            );
+            await operations.refreshCollection().catch(() => undefined);
+        }
     }
 
     async function submitDocumentRename(docId: string) {
@@ -1328,6 +1349,17 @@ export function DocTable({
         } catch (e) {
             console.error("renameDocument failed", e);
             setDocuments((prev) => (previous ? prev.map((d) => (d.id === docId ? previous : d)) : prev));
+            // The backend refuses to rename a document that has no file yet
+            // (nothing to carry the name); say so instead of snapping back
+            // silently. Anything else gets the generic fallback.
+            setCollectionActionWarning(
+                e instanceof MikeApiError && e.status === 404
+                    ? "This document has no file yet, so it can't be renamed."
+                    : userFacingApiError(
+                          e,
+                          "This document could not be renamed. Please try again.",
+                      ),
+            );
         }
     }
 
@@ -3117,9 +3149,46 @@ export function DocTable({
         );
         if (ids.length === 0) return;
         setSelectedFolderIds(new Set());
-        setDocuments((prev) => prev.map((d) => (ids.includes(d.id) ? { ...d, folder_id: null } : d)));
-        await Promise.all(ids.map((id) => operations.moveDocument(id, null).catch(() => {})));
-    }, [docs, operations, requireCapability, selectedStandaloneDocIds, setDocuments]);
+        setDocuments((prev) =>
+            prev.map((document) =>
+                ids.includes(document.id)
+                    ? { ...document, folder_id: null }
+                    : document,
+            ),
+        );
+        const results = await Promise.allSettled(
+            ids.map((id) => operations.moveDocument(id, null)),
+        );
+        const updatedById = new Map(
+            results.flatMap((result) =>
+                result.status === "fulfilled"
+                    ? [[result.value.id, result.value] as const]
+                    : [],
+            ),
+        );
+        setDocuments((prev) =>
+            prev.map((document) =>
+                updatedById.has(document.id)
+                    ? { ...document, ...updatedById.get(document.id)! }
+                    : document,
+            ),
+        );
+        const failedCount = results.length - updatedById.size;
+        if (failedCount > 0) {
+            setCollectionActionWarning(
+                failedCount === 1
+                    ? "A document could not be removed from its folder. Please try again."
+                    : `${failedCount} documents could not be removed from their folders. Please try again.`,
+            );
+            await operations.refreshCollection().catch(() => undefined);
+        }
+    }, [
+        docs,
+        operations,
+        requireCapability,
+        selectedStandaloneDocIds,
+        setDocuments,
+    ]);
 
     const deleteDocumentIds = useCallback(async (ids: string[]) => {
         const owned = ids.filter((id) => {
@@ -4058,16 +4127,39 @@ export function DocTable({
                                                 title={emptyStateTitle}
                                                 description="Upload documents or drop files and folders here"
                                                 action={
-                                                    <PillButton
+                                                    <PillButtonUI
                                                         tone="black"
                                                         size="sm"
+                                                        // Uploading here is
+                                                        // editor-tier, and the
+                                                        // empty state was the
+                                                        // one Upload that
+                                                        // still looked live to
+                                                        // a viewer.
+                                                        disabled={
+                                                            !allowed(
+                                                                "content.edit",
+                                                            )
+                                                        }
+                                                        aria-disabled={
+                                                            !allowed(
+                                                                "content.edit",
+                                                            ) || undefined
+                                                        }
+                                                        title={
+                                                            allowed(
+                                                                "content.edit",
+                                                            )
+                                                                ? undefined
+                                                                : "Only an editor can add documents"
+                                                        }
                                                         onClick={(event) => {
                                                             event.stopPropagation();
                                                             openAddDocuments();
                                                         }}
                                                     >
                                                         Upload
-                                                    </PillButton>
+                                                    </PillButtonUI>
                                                 }
                                             />
                                         </TableEmptyState>
@@ -4499,7 +4591,22 @@ export function DocTable({
                                                         ? handleDownloadSelectedDocs
                                                         : undefined
                                                 }
+                                                newSubfolderDisabled={!allowed("docs.organize")}
                                                 onNewSubfolder={menuFolderAppliesToSelection ? undefined : () => {
+                                                    // The name prompt itself is
+                                                    // only offered to a role
+                                                    // that may create the
+                                                    // folder; the submit gate
+                                                    // in handleCreateFolder
+                                                    // stays as the backstop.
+                                                    if (
+                                                        !requireCapability(
+                                                            "docs.organize",
+                                                            "create folders",
+                                                            "editor",
+                                                        )
+                                                    )
+                                                        return;
                                                     setCreatingFolderIn(contextMenu.folderId);
                                                     setNewFolderName("");
                                                     if (contextMenu.folderId) {

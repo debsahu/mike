@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Document, Workflow } from "../shared/types";
 import { createTabularReview, listWorkflows } from "@/app/lib/mikeApi";
 import { useRouter } from "next/navigation";
@@ -22,6 +22,8 @@ import {
 import { NoModelsWarningPopup } from "../popups/NoModelsWarningPopup";
 import { useUserProfile } from "@/app/contexts/UserProfileContext";
 import { isModelAvailable } from "@/app/lib/modelAvailability";
+import { useConfiguredModels } from "@/app/hooks/useConfiguredModels";
+import { roleFrom } from "@/app/lib/permissions";
 
 interface Props {
     workflow: Workflow | null;
@@ -95,6 +97,11 @@ export function UseWorkflowModal({ workflow, onClose, skipSelect = false }: Prop
     const { profile, loading: profileLoading, apiKeysDegraded } =
         useUserProfile();
     const apiKeys = apiKeysDegraded ? undefined : profile?.apiKeys;
+    const configuredModels = useConfiguredModels();
+    const configuredModelIds = useMemo(
+        () => configuredModels.map((model) => model.id),
+        [configuredModels],
+    );
 
     const router = useRouter();
     const { saveChat, setNewChatMessages } = useChatHistoryContext();
@@ -151,11 +158,12 @@ export function UseWorkflowModal({ workflow, onClose, skipSelect = false }: Prop
             );
         if (
             routerSelectionValid &&
-            (!apiKeys || isModelAvailable(defaultModel, apiKeys))
+            (!apiKeys ||
+                isModelAvailable(defaultModel, apiKeys, configuredModelIds))
         ) {
             setSelectedModel((current) => current || defaultModel);
         }
-    }, [apiKeys, profile, screen, selected, workflow]);
+    }, [apiKeys, configuredModelIds, profile, screen, selected, workflow]);
 
     // Reset configure state on back
     useEffect(() => {
@@ -190,7 +198,18 @@ export function UseWorkflowModal({ workflow, onClose, skipSelect = false }: Prop
         setSaving(true);
         try {
             const projectId = inProject ? selectedProjectId! : undefined;
-            const chatId = await saveChat(projectId);
+            // A project chat inherits the caller's role on the project, so
+            // the optimistic sidebar row must carry that role rather than
+            // assume the creator owns it. The picker rows already carry the
+            // server-computed role; absent one the context falls back to
+            // editor, which is the minimum this action required anyway.
+            const projectRow = projectId
+                ? projects.find((candidate) => candidate.id === projectId)
+                : undefined;
+            const chatId = await saveChat(
+                projectId,
+                projectRow ? roleFrom(projectRow) : null,
+            );
             if (!chatId) return;
             const files = selectedDocuments.map((document) => ({
                 filename: document.filename,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
     Plus,
@@ -70,6 +70,7 @@ import { useUserProfile } from "@/app/contexts/UserProfileContext";
 import {
     getModelProvider,
     isModelAvailable,
+    providerLabel,
     type ModelProvider,
 } from "@/app/lib/modelAvailability";
 import { TRSidePanel } from "./TRSidePanel";
@@ -78,13 +79,15 @@ import type { TRTableHandle } from "./TRTable";
 import { TRChatPanel } from "./TRChatPanel";
 import { TabularReviewDetailsModal } from "./TabularReviewDetailsModal";
 import { exportTabularReviewToExcel } from "./exportToExcel";
+import { readSseFrames } from "@/app/lib/sse";
 import { useSidebar } from "@/app/contexts/SidebarContext";
 import { PageHeader } from "../shared/PageHeader";
 import { TableToolbar } from "../shared/TableToolbar";
-import { TabPillButton } from "@/app/components/ui/tab-pill-button";
+import { TabPillButtonUI } from "@/shared/ui/TabPillButtonUI";
 import { LIQUID_GLASS_FLOAT_CLASS } from "@/shared/ui/LiquidGlassUI";
 import { ModelToggle, type NoModelsReason } from "../assistant/ModelToggle";
 import { SUPPORTED_DOCUMENT_ACCEPT } from "@/app/lib/documentUploadValidation";
+import { useConfiguredModels } from "@/app/hooks/useConfiguredModels";
 
 interface Props {
     reviewId: string;
@@ -92,6 +95,11 @@ interface Props {
 }
 
 export function TRView({ reviewId, projectId }: Props) {
+    const configuredModels = useConfiguredModels();
+    const configuredModelIds = useMemo(
+        () => configuredModels.map((model) => model.id),
+        [configuredModels],
+    );
     const { setSidebarOpen } = useSidebar();
     const [review, setReview] = useState<TabularReview | null>(null);
     const [project, setProject] = useState<Project | null>(null);
@@ -150,6 +158,7 @@ export function TRView({ reviewId, projectId }: Props) {
     const [dropUploadWarning, setDropUploadWarning] = useState<string | null>(
         null,
     );
+    const [projectLoadWarning, setProjectLoadWarning] = useState(false);
     const searchParams = useSearchParams();
     const initialChatParamRef = useRef<string | null>(searchParams.get("chat"));
     const [chatOpen, setChatOpen] = useState(!!initialChatParamRef.current);
@@ -162,8 +171,10 @@ export function TRView({ reviewId, projectId }: Props) {
         colIdx: number;
         rowIdx: number;
     } | null>(null);
-    const [apiKeyModalProvider, setApiKeyModalProvider] =
-        useState<ModelProvider | null>(null);
+    const [apiKeyWarning, setApiKeyWarning] = useState<{
+        kind: "missing" | "rejected";
+        provider: ModelProvider | null;
+    } | null>(null);
     const [noModelsWarning, setNoModelsWarning] =
         useState<NoModelsReason | null>(null);
     const [modelRequiredWarning, setModelRequiredWarning] = useState(false);
@@ -259,7 +270,9 @@ export function TRView({ reviewId, projectId }: Props) {
                     .then((loaded) => {
                         if (!cancelled) setProject(loaded);
                     })
-                    .catch(() => {}),
+                    .catch(() => {
+                        if (!cancelled) setProjectLoadWarning(true);
+                    }),
             );
         } else {
             fetches.push(
@@ -268,7 +281,9 @@ export function TRView({ reviewId, projectId }: Props) {
                         if (!cancelled) setAvailableProjects(loaded);
                     })
                     .catch(() => {
-                        if (!cancelled) setAvailableProjects([]);
+                        if (!cancelled) {
+                            setAvailableProjects([]);
+                        }
                     }),
             );
         }
@@ -333,6 +348,18 @@ export function TRView({ reviewId, projectId }: Props) {
     }
 
     const requireStructure = requireContent;
+
+    /**
+     * Adding columns is `content.edit` server-side, so the refusal belongs at
+     * the button, not at the submit: a viewer used to open the modal, name a
+     * column, write a prompt and pick a format before "Editors only" arrived.
+     * `handleAddColumn` keeps its own gate as the backstop for any other way
+     * in.
+     */
+    function openAddColumns() {
+        if (!requireStructure("add columns")) return;
+        setAddColOpen(true);
+    }
 
     // Who to ask when an action is refused. A review inside a project inherits
     // that project's admin contacts; a standalone review's contact is its
@@ -457,8 +484,14 @@ export function TRView({ reviewId, projectId }: Props) {
             setModelRequiredWarning(true);
             return;
         }
-        if (apiKeys && !isModelAvailable(tabularModel, apiKeys)) {
-            setApiKeyModalProvider(getModelProvider(tabularModel));
+        if (
+            apiKeys &&
+            !isModelAvailable(tabularModel, apiKeys, configuredModelIds)
+        ) {
+            setApiKeyWarning({
+                kind: "missing",
+                provider: getModelProvider(tabularModel),
+            });
             return;
         }
 
@@ -542,43 +575,41 @@ export function TRView({ reviewId, projectId }: Props) {
     // Shared by the POST /generate stream and the GET resume stream, which
     // emit the identical frame shape.
     async function consumeGenerationStream(response: Response) {
-        if (!response.body) throw new Error("No body");
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        let finished = false;
-
-        while (!finished) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() ?? "";
-
-            for (const line of lines) {
-                if (!line.startsWith("data:")) continue;
-                const dataStr = line.slice(5).trim();
-                if (dataStr === "[DONE]") {
-                    finished = true;
-                    break;
+        for await (const frame of readSseFrames(response, {
+            signal: generationAbortRef.current?.signal,
+        })) {
+            try {
+                const data = frame as Record<string, unknown>;
+                if (data.type === "cell_update") {
+                    setCells((prev) =>
+                        prev.map((c) =>
+                            c.row_id === data.row_id &&
+                            c.column_index === data.column_index
+                                ? {
+                                      ...c,
+                                      content: data.content as TabularCell["content"],
+                                      status: data.status as TabularCell["status"],
+                                  }
+                                : c,
+                        ),
+                    );
+                } else if (
+                    data.type === "error" &&
+                    data.code === "invalid_api_key"
+                ) {
+                    setApiKeyWarning({
+                        kind: "rejected",
+                        provider: tabularModel
+                            ? getModelProvider(tabularModel)
+                            : null,
+                    });
                 }
-                try {
-                    const data = JSON.parse(dataStr);
-                    if (data.type === "cell_update") {
-                        setCells((prev) =>
-                            prev.map((c) =>
-                                c.row_id === data.row_id &&
-                                c.column_index === data.column_index
-                                    ? {
-                                          ...c,
-                                          content: data.content,
-                                          status: data.status,
-                                      }
-                                    : c,
-                            ),
-                        );
-                    }
-                } catch {}
+            } catch (err) {
+                console.warn(
+                    "[TabularReviewView] failed to apply cell_update:",
+                    frame,
+                    err,
+                );
             }
         }
     }
@@ -637,8 +668,14 @@ export function TRView({ reviewId, projectId }: Props) {
         // If columns changed since last save, update the review first
         if (columns.length === 0) return;
 
-        if (apiKeys && !isModelAvailable(tabularModel, apiKeys)) {
-            setApiKeyModalProvider(getModelProvider(tabularModel));
+        if (
+            apiKeys &&
+            !isModelAvailable(tabularModel, apiKeys, configuredModelIds)
+        ) {
+            setApiKeyWarning({
+                kind: "missing",
+                provider: getModelProvider(tabularModel),
+            });
             return;
         }
 
@@ -673,7 +710,9 @@ export function TRView({ reviewId, projectId }: Props) {
                         ? (payload.provider as ModelProvider)
                         : getModelProvider(tabularModel);
                 if (payload?.code === "missing_api_key" && provider) {
-                    setApiKeyModalProvider(provider);
+                    setApiKeyWarning({ kind: "missing", provider });
+                } else if (payload?.code === "invalid_api_key") {
+                    setApiKeyWarning({ kind: "rejected", provider });
                 }
                 throw new Error(
                     payload?.detail ?? `Generation failed: ${response.status}`,
@@ -1488,7 +1527,7 @@ export function TRView({ reviewId, projectId }: Props) {
                                                 ref={actionsRef}
                                                 className="relative max-md:hidden"
                                             >
-                                                <TabPillButton
+                                                <TabPillButtonUI
                                                     onClick={() =>
                                                         setActionsOpen(
                                                             (v) => !v,
@@ -1497,7 +1536,7 @@ export function TRView({ reviewId, projectId }: Props) {
                                                 >
                                                     Actions
                                                     <ChevronDown className="h-3.5 w-3.5" />
-                                                </TabPillButton>
+                                                </TabPillButtonUI>
                                                 {actionsOpen && (
                                                     <div
                                                         className={`absolute right-0 top-full z-50 mt-1 w-36 overflow-hidden rounded-lg ${LIQUID_GLASS_FLOAT_CLASS} backdrop-blur-2xl`}
@@ -1525,24 +1564,24 @@ export function TRView({ reviewId, projectId }: Props) {
                                                 )}
                                             </div>
                                             {/* Mobile (toolbar dropdown): flattened entries */}
-                                            <TabPillButton
+                                            <TabPillButtonUI
                                                 onClick={handleClearResults}
                                                 disabled={cellMutationsBlocked}
                                                 className="md:hidden"
                                             >
                                                 Clear results
-                                            </TabPillButton>
-                                            <TabPillButton
+                                            </TabPillButtonUI>
+                                            <TabPillButtonUI
                                                 onClick={handleDeleteDocuments}
                                                 className="md:hidden text-red-600"
                                             >
                                                 Delete
-                                            </TabPillButton>
+                                            </TabPillButtonUI>
                                         </>
                                     )}
                                     {!loading && (
-                                        <TabPillButton
-                                            onClick={() => setAddColOpen(true)}
+                                        <TabPillButtonUI
+                                            onClick={openAddColumns}
                                             disabled={
                                                 savingColumn ||
                                                 savingColumnsConfig
@@ -1550,7 +1589,7 @@ export function TRView({ reviewId, projectId }: Props) {
                                         >
                                             <Plus className="h-3.5 w-3.5" />
                                             Add Columns
-                                        </TabPillButton>
+                                        </TabPillButtonUI>
                                     )}
                                 </div>
                             }
@@ -1627,7 +1666,7 @@ export function TRView({ reviewId, projectId }: Props) {
                                 }}
                                 onUpdateColumn={handleUpdateColumn}
                                 onDeleteColumn={handleDeleteColumn}
-                                onAddColumn={() => setAddColOpen(true)}
+                                onAddColumn={openAddColumns}
                                 onAddDocuments={() => {
                                     if (
                                         !requireStructure(
@@ -1646,13 +1685,9 @@ export function TRView({ reviewId, projectId }: Props) {
                             reviewTitle={review?.title ?? null}
                             projectName={project?.name ?? null}
                             onCitationClick={handleTabularCitationClick}
-                            onClose={() => {
-                                setSelectedChatId(null);
-                                setChatOpen(false);
-                            }}
                             initialChatId={selectedChatId}
                             onChatIdChange={setSelectedChatId}
-                            canSend={canEditContent}
+                            canSend={roleKnown ? canEditContent : null}
                         />
                     )}
                 </div>
@@ -1795,6 +1830,9 @@ export function TRView({ reviewId, projectId }: Props) {
                 resource={review}
                 fetchAccess={getTabularReviewPeople}
                 currentUserEmail={user?.email ?? null}
+                // Both identifiers, so a roster row without an email still
+                // cannot offer the caller a Remove that locks them out.
+                currentUserId={user?.id ?? null}
                 breadcrumb={[
                     "Tabular Reviews",
                     review?.title || "Untitled Review",
@@ -1806,13 +1844,17 @@ export function TRView({ reviewId, projectId }: Props) {
                     ownerLabel: "Review owners",
                     inheritedFromProjectId: review?.project_id ?? null,
                     canManage: can(reviewRole, "access.manage"),
+                    // The mutation is what AccessModal reports on. Reloading
+                    // the roster afterwards is bookkeeping, so its failure
+                    // must not travel back up as "Could not change that role"
+                    // for a grant the server already accepted.
                     onGrant: async (email, role) => {
                         await grantTabularReviewAccess(reviewId, email, role);
-                        await refreshGrants();
+                        await refreshGrants().catch(() => {});
                     },
                     onRevoke: async (email) => {
                         await revokeTabularReviewAccess(reviewId, email);
-                        await refreshGrants();
+                        await refreshGrants().catch(() => {});
                     },
                 }}
             />
@@ -1874,10 +1916,26 @@ export function TRView({ reviewId, projectId }: Props) {
                 message={dropUploadWarning}
             />
 
+            <WarningPopup
+                open={projectLoadWarning}
+                title="Project unavailable"
+                message="The project for this tabular review could not be loaded. Please try again."
+                onClose={() => setProjectLoadWarning(false)}
+            />
+
             <ApiKeyMissingPopup
-                open={apiKeyModalProvider !== null}
-                provider={apiKeyModalProvider}
-                onClose={() => setApiKeyModalProvider(null)}
+                open={apiKeyWarning !== null}
+                title={
+                    apiKeyWarning?.kind === "rejected"
+                        ? "API key rejected"
+                        : undefined
+                }
+                message={
+                    apiKeyWarning?.kind === "rejected"
+                        ? `The ${apiKeyWarning.provider ? providerLabel(apiKeyWarning.provider) : "model provider"} API key was rejected. If you added your own key, check it in Settings → Bring Your Own Keys; otherwise contact your administrator.`
+                        : undefined
+                }
+                onClose={() => setApiKeyWarning(null)}
             />
 
             <NoModelsWarningPopup

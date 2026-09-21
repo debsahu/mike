@@ -84,7 +84,7 @@ test.describe("auth flow", () => {
     const loginButton = page.getByRole("button", { name: "Log in" });
     await expect(loginButton).toHaveClass(/rounded-full/);
     await expect(loginButton).toHaveClass(/bg-gray-950\/88/);
-    await expect(loginButton).toHaveClass(/backdrop-blur-xl/);
+    await expect(loginButton).not.toHaveClass(/backdrop-blur-xl/);
 
     const horizontalOverflow = await page.evaluate(
       () => document.documentElement.scrollWidth - window.innerWidth,

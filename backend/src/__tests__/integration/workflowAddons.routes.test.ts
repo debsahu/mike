@@ -13,7 +13,10 @@ const { from, eq, downloadFile, uploadFile, deleteFile, docxToPdf } =
   }));
 
 vi.mock("../../lib/supabase", () => ({
-  createServerSupabase: () => ({ from }),
+  createServerSupabase: () => ({ from, rpc: async (name: string, args: { p_document_id: string; p_version: Record<string, unknown> }) => {
+    expect(name).toBe("create_document_version");
+    return from("document_versions").insert({ ...args.p_version, document_id: args.p_document_id });
+  } }),
 }));
 
 vi.mock("../../middleware/auth", () => ({
@@ -42,7 +45,7 @@ vi.mock("../../lib/convert", async (importOriginal) => {
   return { ...actual, docxToPdf };
 });
 
-import { workflowAddonsRouter } from "../../routes/workflowAddons";
+import { workflowAddonsRouter } from "../../modules/workflows/workflowAddons.routes";
 
 function queryReturning(data: unknown[]) {
   const query: Record<string, unknown> = {};
@@ -91,7 +94,7 @@ describe("workflow add-on catalog routes", () => {
       table === "mike_workflows"
         ? queryReturning([
             {
-              id: "catalog-1",
+              id: "c0a7a1e1-0000-4000-8000-000000000001",
               workflow_key: "design-partner-draft",
               title: "Design Partner Draft",
               type: "assistant",
@@ -101,7 +104,7 @@ describe("workflow add-on catalog routes", () => {
         : queryReturning([
             {
               id: "reference-1",
-              mike_workflow_id: "catalog-1",
+              mike_workflow_id: "c0a7a1e1-0000-4000-8000-000000000001",
               filename: "Precedent.docx",
               file_type: "docx",
               size_bytes: 42,
@@ -115,7 +118,7 @@ describe("workflow add-on catalog routes", () => {
     expect(response.status).toBe(200);
     expect(response.body).toEqual([
       expect.objectContaining({
-        id: "catalog-1",
+        id: "c0a7a1e1-0000-4000-8000-000000000001",
         addon_key: "design-partner-draft",
         title: "Design Partner Draft",
       }),
@@ -132,13 +135,28 @@ describe("workflow add-on catalog routes", () => {
     expect(eq).toHaveBeenCalledWith("type", "assistant");
   });
 
+  // workflow_addons.id is a uuid; a malformed id used to reach Postgres as
+  // `uuid = 'nope'` (22P02) and, once lookup errors stopped being swallowed,
+  // surfaced as a 500 where main answered 404. The router guards the param.
+  it("answers 404, not 500, for a malformed add-on id on every route", async () => {
+    for (const [method, path] of [
+      ["get", "/workflow-addons/nope"],
+      ["post", "/workflow-addons/nope/import"],
+      ["get", "/workflow-addons/nope/assets/reference-1/display"],
+    ] as const) {
+      const res = await request(app)[method](path);
+      expect(res.status, `${method.toUpperCase()} ${path}`).toBe(404);
+      expect(res.body).toEqual({ detail: "Add-on not found" });
+    }
+  });
+
   it("copies catalog assets into documents and document versions when imported", async () => {
     const insertedDocuments: unknown[] = [];
     const insertedVersions: unknown[] = [];
     from.mockImplementation((table: string) => {
       if (table === "mike_workflows") {
         return singleQueryReturning({
-          id: "catalog-1",
+          id: "c0a7a1e1-0000-4000-8000-000000000001",
           title: "Design Partner Draft",
           type: "assistant",
           prompt_md: "Draft from the precedent.",
@@ -167,7 +185,7 @@ describe("workflow add-on catalog routes", () => {
           {
             filename: "Precedent.docx",
             file_type: "docx",
-            storage_path: "mike-workflows/catalog-1/precedent.docx",
+            storage_path: "mike-workflows/c0a7a1e1-0000-4000-8000-000000000001/precedent.docx",
             size_bytes: 9,
           },
         ]);
@@ -193,12 +211,12 @@ describe("workflow add-on catalog routes", () => {
     });
 
     const response = await request(app).post(
-      "/workflow-addons/catalog-1/import",
+      "/workflow-addons/c0a7a1e1-0000-4000-8000-000000000001/import",
     );
 
     expect(response.status, JSON.stringify(response.body)).toBe(201);
     expect(downloadFile).toHaveBeenCalledWith(
-      "mike-workflows/catalog-1/precedent.docx",
+      "mike-workflows/c0a7a1e1-0000-4000-8000-000000000001/precedent.docx",
     );
     expect(uploadFile).toHaveBeenCalledTimes(2);
     expect(insertedDocuments).toEqual([
@@ -225,7 +243,7 @@ describe("workflow add-on catalog routes", () => {
     from.mockImplementation((table: string) => {
       if (table === "mike_workflows") {
         return singleQueryReturning({
-          id: "catalog-1",
+          id: "c0a7a1e1-0000-4000-8000-000000000001",
           type: "assistant",
         });
       }
@@ -234,19 +252,19 @@ describe("workflow add-on catalog routes", () => {
           id: "reference-1",
           filename: "Deck.pptx",
           file_type: "pptx",
-          storage_path: "mike-workflows/catalog-1/deck.pptx",
+          storage_path: "mike-workflows/c0a7a1e1-0000-4000-8000-000000000001/deck.pptx",
         });
       }
       throw new Error(`Unexpected table ${table}`);
     });
 
     const response = await request(app).get(
-      "/workflow-addons/catalog-1/assets/reference-1/display",
+      "/workflow-addons/c0a7a1e1-0000-4000-8000-000000000001/assets/reference-1/display",
     );
 
     expect(response.status).toBe(200);
     expect(downloadFile).toHaveBeenCalledWith(
-      "mike-workflows/catalog-1/deck.pptx",
+      "mike-workflows/c0a7a1e1-0000-4000-8000-000000000001/deck.pptx",
     );
     expect(docxToPdf).toHaveBeenCalledTimes(1);
     expect(response.headers["content-type"]).toMatch(/^application\/pdf/);

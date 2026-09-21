@@ -1,29 +1,57 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { Db } from "../../supabase";
+import type { AuditEventInput } from "../../audit";
 
-const insertAuditEvent = vi.fn(async () => {});
-const recordAudit = vi.fn(async () => {});
+// Every stub below carries the argument list of the function it replaces.
+// That is what makes `mock.calls[n][m]` a real argument rather than an
+// element of an untyped rest array — the assertions read those positions.
+const insertAuditEvent =
+    vi.fn<(db: Db, event: AuditEventInput) => Promise<void>>(async () => {});
+const recordAudit =
+    vi.fn<(db: Db, event: AuditEventInput) => Promise<void>>(async () => {});
 vi.mock("../../audit", async (importOriginal) => {
     const actual = await importOriginal<typeof import("../../audit")>();
     return {
         ...actual,
-        insertAuditEvent: (...a: unknown[]) => insertAuditEvent(...a),
-        recordAudit: (...a: unknown[]) => recordAudit(...a),
+        insertAuditEvent: (db: Db, event: AuditEventInput) =>
+            insertAuditEvent(db, event),
+        recordAudit: (db: Db, event: AuditEventInput) =>
+            recordAudit(db, event),
     };
 });
 
-const deleteUserAccountData = vi.fn(async () => {});
-vi.mock("../../userDataCleanup", () => ({
-    deleteUserAccountData: (...a: unknown[]) => deleteUserAccountData(...a),
+const deleteUserAccountData =
+    vi.fn<
+        (db: Db, userId: string, userEmail?: string | null) => Promise<void>
+    >(async () => {});
+const listOrgsBlockingAccountDeletion = vi.fn(async () => [] as unknown[]);
+vi.mock("../../../modules/user/user.dataCleanup", () => ({
+    deleteUserAccountData: (
+        db: Db,
+        userId: string,
+        userEmail?: string | null,
+    ) => deleteUserAccountData(db, userId, userEmail),
+    listOrgsBlockingAccountDeletion: () => listOrgsBlockingAccountDeletion(),
 }));
 
-const buildUserAccountExport = vi.fn(async () => ({ hello: "world" }));
-vi.mock("../../userDataExport", async (importOriginal) => {
+const buildUserAccountExport =
+    vi.fn<
+        (
+            db: Db,
+            userId: string,
+            userEmail?: string | null,
+        ) => Promise<{ hello: string }>
+    >(async () => ({ hello: "world" }));
+vi.mock("../../../modules/user/user.dataExport", async (importOriginal) => {
     const actual =
-        await importOriginal<typeof import("../../userDataExport")>();
+        await importOriginal<typeof import("../../../modules/user/user.dataExport")>();
     return {
         ...actual,
-        buildUserAccountExport: (...a: unknown[]) =>
-            buildUserAccountExport(...a),
+        buildUserAccountExport: (
+            db: Db,
+            userId: string,
+            userEmail?: string | null,
+        ) => buildUserAccountExport(db, userId, userEmail),
     };
 });
 
@@ -75,15 +103,21 @@ vi.mock("../../documentVersions", async (importOriginal) => {
     };
 });
 
-const uploadFile = vi.fn(async () => {});
-const deleteFile = vi.fn(async () => {});
-const listFiles = vi.fn(async () => [] as string[]);
+const uploadFile =
+    vi.fn<
+        (key: string, content: ArrayBuffer, contentType: string) => Promise<void>
+    >(async () => {});
+const deleteFile = vi.fn<(key: string) => Promise<void>>(async () => {});
+const listFiles = vi.fn<(prefix: string) => Promise<string[]>>(
+    async () => [] as string[],
+);
 const downloadFile = vi.fn(async (..._a: unknown[]) => new Uint8Array([1, 2, 3]));
 vi.mock("../../storage", () => ({
     assertStorageConfigured: vi.fn(),
-    uploadFile: (...a: unknown[]) => uploadFile(...a),
-    deleteFile: (...a: unknown[]) => deleteFile(...a),
-    listFiles: (...a: unknown[]) => listFiles(...a),
+    uploadFile: (key: string, content: ArrayBuffer, contentType: string) =>
+        uploadFile(key, content, contentType),
+    deleteFile: (key: string) => deleteFile(key),
+    listFiles: (prefix: string) => listFiles(prefix),
     downloadFile: (...a: unknown[]) => downloadFile(...a),
 }));
 
@@ -93,7 +127,8 @@ import {
     handleStorageCleanup,
     handleExportBuild,
     MAX_ZIP_EXPORT_DOCUMENTS,
-} from "../handlers";
+} from "../../../jobs/registry";
+import { NonRetryableJobError } from "../runner";
 import type { DbJob } from "../types";
 
 const JOB = (kind: string, payload: Record<string, unknown>): DbJob => ({
@@ -115,20 +150,29 @@ const JOB = (kind: string, payload: Record<string, unknown>): DbJob => ({
 // Minimal db double for the handlers' own db_jobs queries.
 function makeDb(selectData: unknown[] = []) {
     const deletes: Record<string, unknown>[] = [];
+    // Every requested column list, so a test can assert that a handler asked
+    // for the columns its own access check needs.
+    const selects: string[] = [];
     // Ordered log of everything the handler did, so a test can assert not just
     // WHAT happened but in what order (erasure ordering is the invariant).
     const trace: string[] = [];
-    const authDeleteUser = vi.fn(async () => {
-        trace.push("auth.deleteUser");
-        return { error: null };
-    });
+    // The return type is widened by hand: inferred from this body alone it is
+    // `{ error: null }`, and the tests that drive the retry path override it
+    // with a GoTrue error.
+    const authDeleteUser = vi.fn(
+        async (): Promise<{ error: { message: string } | null }> => {
+            trace.push("auth.deleteUser");
+            return { error: null };
+        },
+    );
     function from() {
         const state: { op: string; filters: Record<string, unknown> } = {
             op: "select",
             filters: {},
         };
         const b: Record<string, unknown> = {
-            select() {
+            select(columns?: string) {
+                if (typeof columns === "string") selects.push(columns);
                 return b;
             },
             delete() {
@@ -166,6 +210,7 @@ function makeDb(selectData: unknown[] = []) {
     }
     return {
         deletes,
+        selects,
         trace,
         from,
         auth: { admin: { deleteUser: authDeleteUser } },
@@ -203,9 +248,7 @@ describe("handleChatTurnAudit", () => {
         );
         // chat.message + document.generated
         expect(insertAuditEvent).toHaveBeenCalledTimes(2);
-        const actions = insertAuditEvent.mock.calls.map(
-            (c) => (c[1] as { action: string }).action,
-        );
+        const actions = insertAuditEvent.mock.calls.map((c) => c[1].action);
         expect(actions).toEqual(["chat.message", "document.generated"]);
     });
 
@@ -232,6 +275,29 @@ describe("handleChatTurnAudit", () => {
 });
 
 describe("handleAccountDelete", () => {
+    it("refuses, terminally, before destroying anything when an org blocks it", async () => {
+        // The route answers 409 for this account, but an org can gain a
+        // member between the request and the job, and old rows can be
+        // requeued. Ask BEFORE the first delete — and throw the
+        // non-retryable error, because no number of retries will give the
+        // organization a second admin.
+        const db = makeDb([]);
+        listOrgsBlockingAccountDeletion.mockResolvedValueOnce([
+            { org_id: "o1", name: "Org A", reason: "members" },
+        ]);
+
+        await expect(
+            handleAccountDelete(
+                db as never,
+                JOB("account.delete", { userId: "u1", userEmail: "u@x.test" }),
+            ),
+        ).rejects.toThrow(NonRetryableJobError);
+
+        expect(deleteUserAccountData).not.toHaveBeenCalled();
+        expect(db.auth.admin.deleteUser).not.toHaveBeenCalled();
+        expect(db.deletes).toHaveLength(0);
+    });
+
     it("runs the cascade and purges the user's other queue rows (not itself)", async () => {
         const db = makeDb([]);
         await handleAccountDelete(
@@ -251,11 +317,10 @@ describe("handleAccountDelete", () => {
         );
     });
 
-    // documents.user_id references auth.users ON DELETE CASCADE, and
-    // document_versions cascades from documents, so deleting the auth user is
-    // what destroys the rows recording where this account's files live. Do it
-    // first and the cascade has nothing left to read — the objects are
-    // orphaned in storage with no row pointing at them, forever.
+    // documents.user_id references auth.users ON DELETE SET NULL, so deleting
+    // the auth user first would not erase this account's rows — it would
+    // anonymise them, past the reach of every `eq("user_id", userId)` delete
+    // in the cascade, with their storage objects left behind forever.
     it("deletes the auth user LAST, after the data cascade", async () => {
         const db = makeDb([]);
         deleteUserAccountData.mockImplementation(async () => {
@@ -496,6 +561,45 @@ describe("handleExportBuild", () => {
         expect(contentType).toBe("application/zip");
         expect(out.filename).toBe("documents.zip");
         expect(out.content_type).toBe("application/zip");
+    });
+
+    // ensureDocAccess resolves a workflow asset through its workflow and an
+    // org document through its org. Selecting only user_id/project_id made
+    // both branches unreachable, so an org colleague's document and every
+    // detached document were silently dropped from the zip — the async
+    // export quietly returned less than the synchronous one.
+    it("selects the columns its own access check needs", async () => {
+        const db = makeDb([
+            {
+                id: "d1",
+                user_id: null,
+                project_id: null,
+                org_id: "o1",
+                workflow_id: "w1",
+            },
+        ]);
+
+        await handleExportBuild(
+            db as never,
+            JOB("export.build", {
+                userId: "u1",
+                userEmail: "u@x.test",
+                type: "documents-zip",
+                document_ids: ["d1"],
+            }),
+        );
+
+        const documentSelect = db.selects.find((columns) =>
+            columns.includes("current_version_id"),
+        );
+        expect(documentSelect).toContain("org_id");
+        expect(documentSelect).toContain("workflow_id");
+        expect(ensureDocAccess).toHaveBeenCalledWith(
+            expect.objectContaining({ org_id: "o1", workflow_id: "w1" }),
+            "u1",
+            "u@x.test",
+            db,
+        );
     });
 
     it("fails a documents-zip job whose documents are all inaccessible", async () => {

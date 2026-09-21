@@ -16,9 +16,13 @@ import type { ApiKeyState } from "../lib/mikeApi";
  * (frontend/src/wordAddin/catalogParity.test.ts) can compare it against the
  * add-in's hand-mirrored copy instead of restating the rule.
  */
-export function isAllowedModelId(id: string): boolean {
+export function isAllowedModelId(
+    id: string,
+    configuredModelIds: readonly string[] = [],
+): boolean {
     return (
         ALLOWED_MODEL_IDS.has(id) ||
+        configuredModelIds.includes(id) ||
         id.startsWith("ollama/") ||
         id.startsWith("claude-code/") ||
         ROUTER_SLUGS.some((slug) => id.startsWith(`${slug}/`))
@@ -36,6 +40,8 @@ export interface SelectedModelSources {
     } | null;
     /** Undefined means availability is unknown and must fail open. */
     apiKeys?: ApiKeyState;
+    /** Authenticated deployment models returned by GET /models/configured. */
+    configuredModelIds?: readonly string[];
 }
 
 function usableStoredModel(
@@ -44,7 +50,9 @@ function usableStoredModel(
 ): string | null {
     if (!value) return null;
     const canonical = canonicalModelId(value);
-    if (!isAllowedModelId(canonical)) return null;
+    if (!isAllowedModelId(canonical, sources.configuredModelIds)) return null;
+
+    if (sources.configuredModelIds?.includes(canonical)) return canonical;
 
     const router = ROUTER_SLUGS.find((slug) =>
         canonical.startsWith(`${slug}/`),
@@ -75,6 +83,7 @@ export function useSelectedModel(
     const openRouterModels = sources.routerSelections?.openRouterModels;
     const vercelModels = sources.routerSelections?.vercelModels;
     const openCodeGoModels = sources.routerSelections?.openCodeGoModels;
+    const configuredModelIds = sources.configuredModelIds;
     const hasRouterSelections = sources.routerSelections != null;
     const selectionSources = useMemo<SelectedModelSources>(
         () => ({
@@ -89,6 +98,7 @@ export function useSelectedModel(
                   }
                 : null,
             apiKeys: sources.apiKeys,
+            configuredModelIds,
         }),
         [
             sources.selectionKey,
@@ -99,6 +109,7 @@ export function useSelectedModel(
             vercelModels,
             openCodeGoModels,
             sources.apiKeys,
+            configuredModelIds,
         ],
     );
 
@@ -129,12 +140,17 @@ export function useSelectedModel(
     }, [selectionSources]);
     /* eslint-enable react-hooks/set-state-in-effect */
 
-    const setModel = useCallback((id: string) => {
-        const canonical = canonicalModelId(id);
-        const next = isAllowedModelId(canonical) ? canonical : "";
-        manuallySelected.current = true;
-        setModelState(next);
-    }, []);
+    const setModel = useCallback(
+        (id: string) => {
+            const canonical = canonicalModelId(id);
+            const next = isAllowedModelId(canonical, configuredModelIds)
+                ? canonical
+                : "";
+            manuallySelected.current = true;
+            setModelState(next);
+        },
+        [configuredModelIds],
+    );
 
     return [model, setModel];
 }

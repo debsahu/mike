@@ -1,7 +1,5 @@
-import type { createServerSupabase } from "./supabase";
+import type { Db } from "./supabase";
 import type { ProjectRole } from "./permissions";
-
-type Db = ReturnType<typeof createServerSupabase>;
 
 export type OrgResourceKind =
     | "project"
@@ -110,6 +108,48 @@ export async function findOrgMemberByEmail(
             detail: "Organization membership has an invalid role",
         };
     return { ok: true, member: { userId, email, orgRole } };
+}
+
+/** A resource creator and an organization admin retain owner access. Keep the
+ * target lookup and this rule identical for project and workflow assignments.
+ * Callers still authorize the actor's access.manage permission first.
+ */
+export async function findAssignableOrgMember(
+    db: Db,
+    orgId: string,
+    email: string,
+    creatorId: string | null,
+): Promise<
+    | {
+          ok: true;
+          member: {
+              userId: string;
+              email: string;
+              orgRole: "admin" | "member";
+          };
+      }
+    | { ok: false; kind: "validation"; detail: string }
+    | { ok: false; kind: "db_error"; error: unknown }
+> {
+    const target = await findOrgMemberByEmail(db, orgId, email);
+    if (!target.ok) {
+        if (target.kind === "not_found")
+            return { ok: false, kind: "validation", detail: target.detail };
+        return { ok: false, kind: "db_error", error: target.detail };
+    }
+    if (target.member.userId === creatorId)
+        return {
+            ok: false,
+            kind: "validation",
+            detail: "The creator is always an owner",
+        };
+    if (target.member.orgRole === "admin")
+        return {
+            ok: false,
+            kind: "validation",
+            detail: "Organization admins always have owner access",
+        };
+    return target;
 }
 
 export async function listOrgAccessPeople(
@@ -274,6 +314,50 @@ export async function setOrgAccessOverride(
         };
     }
     return { ok: true, override: data as OrgAccessOverride };
+}
+
+/**
+ * Persist a WHOLE BATCH of overrides in one statement.
+ *
+ * A loop of single upserts is not atomic: the org-membership triggers on
+ * these tables can refuse the fourth row after the first three have already
+ * committed, and the caller then answers 500 with access silently changed for
+ * three people. One upsert is one statement, so a trigger refusal on any
+ * target rolls the whole batch back and nothing is written.
+ */
+export async function setOrgAccessOverrides(
+    db: Db,
+    params: {
+        kind: OrgResourceKind;
+        resourceId: string;
+        orgId: string;
+        userIds: string[];
+        role: OrgAssignableRole;
+        assignedBy: string;
+    },
+): Promise<{ ok: true } | { ok: false; detail: string }> {
+    if (params.userIds.length === 0) return { ok: true };
+    const config = CONFIG[params.kind];
+    const updatedAt = new Date().toISOString();
+    const { error } = await db.from(config.table).upsert(
+        params.userIds.map((userId) => ({
+            [config.resourceColumn]: params.resourceId,
+            org_id: params.orgId,
+            user_id: userId,
+            role: params.role,
+            assigned_by: params.assignedBy,
+            updated_at: updatedAt,
+        })),
+        { onConflict: `${config.resourceColumn},user_id` },
+    );
+    if (error)
+        return {
+            ok: false,
+            detail:
+                error.message ??
+                "Failed to save organization access overrides",
+        };
+    return { ok: true };
 }
 
 export async function deleteOrgAccessOverride(

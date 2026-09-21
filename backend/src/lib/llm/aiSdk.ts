@@ -10,9 +10,45 @@ import type {
   StreamChatParams,
   StreamChatResult,
 } from "./types";
+import { toProviderStreamError } from "./providerErrors";
 import { createRawLlmStreamRecorder, logRawLlmStream } from "./rawStreamLog";
 
 const MAX_OUTPUT_TOKENS = 16_384;
+
+/**
+ * Tool-call rounds allowed per turn before `stopWhen` halts the run.
+ *
+ * 16, matching what the Word pane already passes. Document-heavy turns spend
+ * several rounds just reading before any real work starts, and when this cap
+ * fires the run simply ends — no error, no partial answer — so a value that is
+ * merely "usually enough" fails invisibly. Callers may still override it.
+ */
+export const DEFAULT_MAX_ITERATIONS = 16;
+
+/**
+ * User-facing explanation for a turn that ended without finishing, or "" when
+ * it ended normally.
+ *
+ * Exported for tests: the conditions are easy to get subtly wrong, and wrong
+ * here means either a spurious warning under every good answer or silence
+ * under every bad one.
+ */
+export function stopNotice(
+  iterations: number,
+  maxIterations: number,
+  finishReason: string | undefined,
+): string {
+  if (finishReason === "length") {
+    return "\n\n_Stopped early: this response reached the model's output limit. Asking for one part at a time will get the rest._";
+  }
+  // Reaching the last round while still asking for tools means the model was
+  // mid-work when stopWhen cut it off. Reaching it on "stop" means it had
+  // finished and the round count is a coincidence, so say nothing.
+  if (iterations >= maxIterations && finishReason !== "stop") {
+    return `\n\n_Stopped after ${maxIterations} tool-call rounds without finishing. This is a step limit, not a length limit — narrowing the request, or pointing at fewer documents, usually resolves it._`;
+  }
+  return "";
+}
 
 /** Ensure a proxy-closed final SSE event is still visible to SDK parsers. */
 export async function aiSdkFetch(
@@ -44,8 +80,21 @@ export async function aiSdkFetch(
       try {
         JSON.parse(partial.arguments);
       } catch {
+        // A clean terminal event proves that the transport delivered the
+        // complete provider response. Preserve malformed arguments exactly as
+        // sent so AI SDK can emit its recoverable dynamic tool-error instead
+        // of preempting its tool-validation path. A stream that just closes is
+        // still unsafe: its partial arguments must fail before any tool could
+        // run.
+        if (!endedCleanly) {
+          throw new Error(
+            `LLM stream ended with malformed JSON arguments for tool "${partial.name}".`,
+          );
+        }
+      }
+      if (!endedCleanly) {
         throw new Error(
-          `LLM stream ended with malformed JSON arguments for tool "${partial.name}".`,
+          `LLM stream ended before a clean terminal event for tool "${partial.name}".`,
         );
       }
     }
@@ -155,6 +204,8 @@ export class ToolExecutionBatcher {
 
   constructor(
     private readonly runTools: NonNullable<StreamChatParams["runTools"]>,
+    /** Fired synchronously when runTools rejects, before the SDK learns of it. */
+    private readonly onFailure?: (error: unknown) => void,
   ) {}
 
   execute(call: NormalizedToolCall): Promise<string> {
@@ -183,16 +234,17 @@ export class ToolExecutionBatcher {
       for (const item of pending) {
         const content = byId.get(item.call.id);
         if (content === undefined) {
-          item.reject(
-            new Error(
-              `Tool ${item.call.name} returned no result for call ${item.call.id}.`,
-            ),
+          const error = new Error(
+            `Tool ${item.call.name} returned no result for call ${item.call.id}.`,
           );
+          this.onFailure?.(error);
+          item.reject(error);
         } else {
           item.resolve(content);
         }
       }
     } catch (error) {
+      this.onFailure?.(error);
       for (const item of pending) item.reject(error);
     }
   }
@@ -208,10 +260,13 @@ function toAiSdkTools(
   schemas: OpenAIToolSchema[],
   runTools?: StreamChatParams["runTools"],
   sdk?: Pick<typeof AiSdk, "jsonSchema" | "tool">,
+  onRunToolsFailure?: (error: unknown) => void,
 ): ToolSet | undefined {
   if (!schemas.length) return undefined;
   if (!sdk) throw new Error("AI SDK tool helpers are unavailable.");
-  const batcher = runTools ? new ToolExecutionBatcher(runTools) : null;
+  const batcher = runTools
+    ? new ToolExecutionBatcher(runTools, onRunToolsFailure)
+    : null;
 
   return Object.fromEntries(
     schemas.map((schema) => {
@@ -245,6 +300,15 @@ function errorMessage(error: unknown, label: string): string {
   return `${label} stream failed.`;
 }
 
+/**
+ * The ORIGINAL Error instance from a `tool-error` / `error` part. Re-wrapping
+ * it discards error identity, including control-flow and user-facing error
+ * types thrown inside runTools (the SDK's tool `execute`).
+ */
+function rethrowable(error: unknown, label: string): Error {
+  return error instanceof Error ? error : new Error(errorMessage(error, label));
+}
+
 function usesCourtlistenerTool(
   steps: Array<{ toolCalls: Array<{ toolName: string }> }>,
 ) {
@@ -255,12 +319,78 @@ function usesCourtlistenerTool(
   );
 }
 
+/**
+ * Provider-specific hints that let a multi-turn conversation reuse the
+ * already-processed prompt prefix instead of paying for it on every turn.
+ *
+ * OpenAI caches automatically but routes by `prompt_cache_key`; sending the
+ * conversation id keeps consecutive turns on the same cache. Anthropic only
+ * caches up to an explicit breakpoint, so the last message gets one: it
+ * covers the system prompt, tool definitions, and every earlier turn, and
+ * the next request hits that prefix as long as it is byte-identical.
+ * Providers ignore namespaces they do not own, so both hints are sent.
+ */
+type StreamTextProviderOptions = NonNullable<
+  Parameters<typeof AiSdk.streamText>[0]["providerOptions"]
+>;
+
+export function withPrefixCacheHints(params: StreamChatParams): {
+  messages: AiSdk.ModelMessage[];
+  providerOptions?: StreamTextProviderOptions;
+} {
+  if (!params.conversationId || !params.messages.length) {
+    return { messages: params.messages };
+  }
+  const last = params.messages.length - 1;
+  const breakpoint = {
+    anthropic: { cacheControl: { type: "ephemeral" } },
+  };
+  return {
+    messages: params.messages.map((message, index): AiSdk.ModelMessage => {
+      if (index !== last) return message;
+      return message.role === "assistant"
+        ? { role: "assistant", content: message.content, providerOptions: breakpoint }
+        : { role: "user", content: message.content, providerOptions: breakpoint };
+    }),
+    providerOptions: {
+      openai: { promptCacheKey: params.conversationId },
+    },
+  };
+}
+
 export async function streamAiSdk(
   params: StreamChatParams,
   config: AiSdkAdapterConfig,
 ): Promise<StreamChatResult> {
   const sdk = await import("ai");
-  const tools = toAiSdkTools(params.tools ?? [], params.runTools, sdk);
+  // Internal abort linked to the caller's signal: a runTools failure (e.g. the
+  // ask_inputs pause) ends the turn, but the SDK's step loop would fire the
+  // NEXT model request before this consumer sees the `tool-error` part — so
+  // abort synchronously in the batcher's failure path and keep that first
+  // failure (the stream may surface an `abort` part before the `tool-error`).
+  const internalAbort = new AbortController();
+  const forwardAbort = () => internalAbort.abort(params.abortSignal?.reason);
+  if (params.abortSignal?.aborted) forwardAbort();
+  else params.abortSignal?.addEventListener("abort", forwardAbort, { once: true });
+  const runToolsFailure: { first: { error: unknown } | null } = { first: null };
+  const tools = toAiSdkTools(params.tools ?? [], params.runTools, sdk, (error) => {
+    runToolsFailure.first ??= { error };
+    internalAbort.abort();
+  });
+  // An exception that merely LOOKS like an abort (name "AbortError" or
+  // isAbortError's exact message) must not take streaming.ts's silent
+  // user-cancel path unless the caller's signal really is aborted.
+  const guardAbortShaped = (e: Error): Error =>
+    params.abortSignal?.aborted ||
+    (e.name !== "AbortError" && e.message !== "Stream aborted.")
+      ? e
+      : new Error(
+          e.message === "Stream aborted."
+            ? "Stream aborted. (no abort was requested; treated as an error)"
+            : e.message,
+          { cause: e },
+        );
+  const cacheHints = withPrefixCacheHints(params);
   const rawStreamRecorder = createRawLlmStreamRecorder({
     provider: config.provider,
     model: config.modelId,
@@ -268,16 +398,21 @@ export async function streamAiSdk(
   let fullText = "";
   let iteration = 0;
   const openReasoningBlocks = new Set<string>();
+  const maxIterations = params.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+  let lastFinishReason: string | undefined;
 
   try {
     const result = sdk.streamText({
       model: config.model,
       system: params.systemPrompt,
-      messages: params.messages,
+      messages: cacheHints.messages,
+      ...(cacheHints.providerOptions
+        ? { providerOptions: cacheHints.providerOptions }
+        : {}),
       tools,
       maxOutputTokens: MAX_OUTPUT_TOKENS,
-      stopWhen: sdk.stepCountIs(params.maxIterations ?? 10),
-      abortSignal: params.abortSignal,
+      stopWhen: sdk.stepCountIs(maxIterations),
+      abortSignal: internalAbort.signal,
       reasoning:
         config.supportsReasoning === false
           ? undefined
@@ -349,10 +484,23 @@ export async function streamAiSdk(
           params.callbacks?.onToolCallStart?.(call);
           break;
         }
+        case "finish-step":
+          lastFinishReason = part.finishReason;
+          break;
+        // A tool's own failure is not the model provider's: a search tool
+        // answering 401 says nothing about our LLM key, so this path keeps the
+        // executor error rather than blaming the user's credentials.
         case "tool-error":
-          throw new Error(errorMessage(part.error, config.label));
+          // `dynamic: true` = the SDK synthesized this part for a call it could
+          // not dispatch (unknown tool / unparseable input); it already queued
+          // the error as that call's result and continues the loop so the
+          // model can recover. Mike's tools are static, so only a genuine
+          // execute() failure reaches the throw.
+          if ((part as { dynamic?: boolean }).dynamic === true) break;
+          runToolsFailure.first ??= { error: part.error };
+          throw guardAbortShaped(rethrowable(part.error, config.label));
         case "error":
-          throw new Error(errorMessage(part.error, config.label));
+          throw guardAbortShaped(toProviderStreamError(part.error, config));
         case "abort": {
           const error = new Error(part.reason || "Stream aborted.");
           error.name = "AbortError";
@@ -365,11 +513,29 @@ export async function streamAiSdk(
       openReasoningBlocks.delete(id);
       params.callbacks?.onReasoningBlockEnd?.();
     }
+    // A run halted by stopWhen, or cut off at the output ceiling, otherwise
+    // ends exactly like a finished one: streamText just stops and this
+    // function returns whatever text happened to accumulate. That renders as
+    // a bare "Completed in N steps" with no answer and no error, which is
+    // indistinguishable from the model having nothing to say. Name it instead.
+    const notice = stopNotice(iteration, maxIterations, lastFinishReason);
+    if (notice) {
+      fullText += notice;
+      params.callbacks?.onContentDelta?.(notice);
+    }
     await rawStreamRecorder?.flush("completed");
     return { fullText };
   } catch (error) {
-    await rawStreamRecorder?.flush("error", error);
-    throw error;
+    internalAbort.abort();
+    // Only model-provider failures are eligible for API-key/quota guidance.
+    // Tool failures (including pauses) retain their original identity.
+    const fatal = runToolsFailure.first
+      ? guardAbortShaped(rethrowable(runToolsFailure.first.error, config.label))
+      : guardAbortShaped(toProviderStreamError(error, config));
+    await rawStreamRecorder?.flush("error", fatal);
+    throw fatal;
+  } finally {
+    params.abortSignal?.removeEventListener("abort", forwardAbort);
   }
 }
 

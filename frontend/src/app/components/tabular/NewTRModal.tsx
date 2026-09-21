@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Upload } from "lucide-react";
 import type { Document, Folder, Project, Workflow } from "../shared/types";
 import {
@@ -17,7 +17,7 @@ import { FileDirectory } from "../shared/FileDirectory";
 import { Modal } from "../modals/Modal";
 import { ModalSelect } from "../modals/ModalSelect";
 import { FieldLabel, FormTextInput } from "../ui/form-field";
-import { ToggleSwitch } from "@/app/components/ui/toggle-switch";
+import { ToggleSwitchUI } from "@/shared/ui/ToggleSwitchUI";
 import {
     ModelToggle,
     type NoModelsReason,
@@ -31,6 +31,7 @@ import {
     CreateAccessStep,
     type PendingDirectGrant,
 } from "../modals/CreateAccessStep";
+import { useConfiguredModels } from "@/app/hooks/useConfiguredModels";
 
 const isDev = process.env.NODE_ENV !== "production";
 const devLog = (...args: Parameters<typeof console.log>) => {
@@ -41,6 +42,12 @@ const TABULAR_DIRECTORY_TABS = ["files", "projects"] as const;
 interface Props {
     open: boolean;
     onClose: () => void;
+    /**
+     * Creates the review. Resolving with a string means the review itself was
+     * created but part of the request was not honoured — the dialog stays open
+     * and shows that message, and pressing Create again retries the remainder
+     * against the same review rather than making a second one.
+     */
     onAdd: (
         title: string,
         projectId: string | undefined,
@@ -49,7 +56,7 @@ interface Props {
         documentGrouping: "document" | "folder" | undefined,
         model: string,
         accessAssignments: { email: string; role: AccessAssignmentRole }[],
-    ) => Promise<void> | void;
+    ) => Promise<string | void> | void;
     projects?: Project[];
     /** When provided, skip the project/directory picker and show only these docs */
     projectDocs?: Document[];
@@ -85,8 +92,15 @@ export function NewTRModal({
         useUserProfile();
     const { user } = useAuth();
     const apiKeys = apiKeysDegraded ? undefined : profile?.apiKeys;
+    const configuredModels = useConfiguredModels();
+    const configuredModelIds = useMemo(
+        () => configuredModels.map((model) => model.id),
+        [configuredModels],
+    );
 
-    // Project-scoped docs (when underProject is true and no fixedProjectDocs)
+    // Project-scoped docs fetched for the "under project" toggle. In project
+    // mode the list comes from the fixedProjectDocs prop instead, so this only
+    // holds documents uploaded from inside the modal.
     const [projectDocs, setProjectDocs] = useState<Document[]>([]);
     const [projectFolders, setProjectFolders] = useState<Folder[]>([]);
     const [loadingDocs, setLoadingDocs] = useState(false);
@@ -98,6 +112,13 @@ export function NewTRModal({
     const [groupBySubfolder, setGroupBySubfolder] = useState(false);
     const [uploading, setUploading] = useState(false);
     const [creating, setCreating] = useState(false);
+    // The review already exists, because a first attempt created it and then
+    // failed on the grants. The page holds that row and the retry reuses it,
+    // so the earlier steps no longer describe anything this dialog can still
+    // change: switching Personal → a project on the second attempt left the
+    // review where it was created and applied the new scope's assignments to
+    // it. Back retires once this is true.
+    const [reviewExists, setReviewExists] = useState(false);
     const [uploadError, setUploadError] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const creatingRef = useRef(false);
@@ -109,6 +130,21 @@ export function NewTRModal({
         null,
     );
     const formId = "new-tabular-review-modal-form";
+    const preselectedProjectDocsRef = useRef(false);
+
+    // Derived, not copied into state: the parent passes `[]` until the project
+    // has loaded, so a snapshot taken when the modal opened left the picker
+    // permanently empty for anyone who opened it early.
+    const projectModeDocs: Document[] = [];
+    if (isProjectMode) {
+        const seen = new Set<string>();
+        for (const doc of [...projectDocs, ...(fixedProjectDocs ?? [])]) {
+            if (seen.has(doc.id)) continue;
+            seen.add(doc.id);
+            projectModeDocs.push(doc);
+        }
+    }
+    const projectModeDocsKey = projectModeDocs.map((doc) => doc.id).join(",");
 
     useEffect(() => {
         if (!open) return;
@@ -138,11 +174,7 @@ export function NewTRModal({
             })
             .finally(() => setLoadingWorkflows(false));
 
-        if (isProjectMode) {
-            const readyProjectDocuments = fixedProjectDocs ?? [];
-            setProjectDocs(readyProjectDocuments);
-            setSelectedDocuments(readyProjectDocuments);
-        }
+        if (isProjectMode) preselectedProjectDocsRef.current = false;
     }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
     useEffect(() => {
@@ -162,16 +194,39 @@ export function NewTRModal({
                 defaultModel.slice(router.length + 1),
             );
         const providerAvailable =
-            !apiKeys || isModelAvailable(defaultModel, apiKeys);
+            !apiKeys ||
+            isModelAvailable(defaultModel, apiKeys, configuredModelIds);
         if (routerSelectionValid && providerAvailable) {
             setSelectedModel((current) => current || defaultModel);
         }
-    }, [apiKeys, open, profile]);
+    }, [apiKeys, configuredModelIds, open, profile]);
+
+    // Preselect every project document once, as soon as they're available —
+    // which may be after the modal opened, since the parent's list is empty
+    // while the project is still loading. Only the first non-empty list wins,
+    // so later renders don't stomp on the user's own selection.
+    useEffect(() => {
+        if (!open || !isProjectMode) return;
+        if (preselectedProjectDocsRef.current || !projectModeDocs.length)
+            return;
+        preselectedProjectDocsRef.current = true;
+        setSelectedDocuments(projectModeDocs);
+    }, [open, isProjectMode, projectModeDocsKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
     if (!open) return null;
 
+    // Dismissal — Escape, the backdrop and the close button all arrive here.
+    // A create in flight owns the dialog: leaving now would strand the only
+    // account of what happened to it. The success path calls `handleClose`
+    // directly, which is why the guard lives here and not there.
+    function handleDismiss() {
+        if (creatingRef.current) return;
+        handleClose();
+    }
+
     function handleClose() {
         setStep("details");
+        setReviewExists(false);
         setTitle("");
         setUnderProject(false);
         setSelectedProjectId("");
@@ -210,6 +265,7 @@ export function NewTRModal({
         if (creatingRef.current) return;
         creatingRef.current = true;
         setCreating(true);
+        setUploadError(null);
         const selectedWorkflow = workflows.find(
             (w) => w.id === selectedWorkflowId,
         );
@@ -220,7 +276,7 @@ export function NewTRModal({
               : undefined;
         const assignments = effectiveProjectId ? [] : directGrants;
         try {
-            await onAdd(
+            const partialFailure = await onAdd(
                 title.trim(),
                 effectiveProjectId,
                 selectedDocuments.length > 0
@@ -231,6 +287,14 @@ export function NewTRModal({
                 selectedModel,
                 assignments,
             );
+            if (partialFailure) {
+                // The review exists. Report what did not happen and stay open;
+                // closing here would hide the only account of it, and the
+                // generic create failure would be a lie.
+                setUploadError(partialFailure);
+                setReviewExists(true);
+                return;
+            }
             handleClose();
         } catch (error) {
             setUploadError(
@@ -343,7 +407,7 @@ export function NewTRModal({
 
     // What to show in the directory depends on mode and toggle state
     const directoryDocuments = isProjectMode
-        ? projectDocs
+        ? projectModeDocs
         : underProject
           ? projectDocs
           : extraStandaloneDocs;
@@ -370,7 +434,7 @@ export function NewTRModal({
     return (
         <Modal
             open={open}
-            onClose={handleClose}
+            onClose={handleDismiss}
             breadcrumbs={[
                 ...breadcrumbs,
                 step === "details"
@@ -389,7 +453,14 @@ export function NewTRModal({
                               <Upload className="h-3.5 w-3.5" />
                           ),
                           onClick: () => fileInputRef.current?.click(),
-                          disabled: uploading,
+                          // Once the review exists a retry reuses it and
+                          // never re-reads the document set, so anything
+                          // uploaded or ticked here on the second attempt was
+                          // dropped without a word. Freeze both.
+                          disabled: uploading || reviewExists,
+                          title: reviewExists
+                              ? "The review has been created — add documents from the review itself."
+                              : undefined,
                       }
                     : step === "access"
                       ? {
@@ -405,7 +476,10 @@ export function NewTRModal({
                     ? {
                           label: "Back",
                           onClick: () => setStep("access"),
-                          disabled: uploading,
+                          disabled: uploading || reviewExists,
+                          title: reviewExists
+                              ? "The review has been created — its details and access can be changed from the review itself."
+                              : undefined,
                       }
                     : step === "access"
                       ? {
@@ -521,7 +595,7 @@ export function NewTRModal({
                         {!isProjectMode && (
                             <div className="space-y-3">
                                 <FieldLabel as="p">Project</FieldLabel>
-                                <ToggleSwitch
+                                <ToggleSwitchUI
                                     checked={underProject}
                                     onCheckedChange={(next) => {
                                         setUnderProject(next);
@@ -534,7 +608,7 @@ export function NewTRModal({
                                     }}
                                 >
                                     Create under a project
-                                </ToggleSwitch>
+                                </ToggleSwitchUI>
 
                                 {underProject && (
                                     <ModalSelect
@@ -555,13 +629,13 @@ export function NewTRModal({
 
                         <div>
                             <FieldLabel as="p">Document grouping</FieldLabel>
-                            <ToggleSwitch
+                            <ToggleSwitchUI
                                 checked={groupBySubfolder}
                                 onCheckedChange={setGroupBySubfolder}
                             >
                                 Treat documents in the same folder as one review
                                 row
-                            </ToggleSwitch>
+                            </ToggleSwitchUI>
                         </div>
                     </div>
                 ) : step === "access" ? (
@@ -576,6 +650,13 @@ export function NewTRModal({
                     />
                 ) : (
                     <div className="flex min-h-0 flex-1 flex-col">
+                        {reviewExists && (
+                            <p className="mb-3 text-sm text-gray-500">
+                                The review has been created, so its documents
+                                can no longer be changed here. Add documents
+                                from the review once access has been granted.
+                            </p>
+                        )}
                         {showDirectory && (
                             <FileDirectory
                                 documents={directoryDocuments}
@@ -583,6 +664,7 @@ export function NewTRModal({
                                 loading={directoryLoading}
                                 selectedDocuments={selectedDocuments}
                                 onChange={setSelectedDocuments}
+                                selectionDisabled={reviewExists}
                                 showTabs={!isProjectMode && !underProject}
                                 tabs={TABULAR_DIRECTORY_TABS}
                             />

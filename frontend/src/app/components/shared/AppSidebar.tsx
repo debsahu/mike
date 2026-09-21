@@ -23,6 +23,7 @@ import { MikeIcon } from "@/app/components/chat/mike-icon";
 import { SidebarChatItem } from "@/app/components/shared/SidebarChatItem";
 import {
     ChatSkeuoIcon,
+    IdeSkeuoIcon,
     FolderSkeuoIcon,
     LibrarySkeuoIcon,
     TabularReviewSkeuoIcon,
@@ -36,6 +37,11 @@ import { ProjectSvgIcon } from "@/app/components/shared/FolderSvgIcon";
 import { listProjectSummaries } from "@/app/lib/mikeApi";
 import type { Project } from "@/app/components/shared/types";
 import { cn } from "@/app/lib/utils";
+import { WarningPopup } from "@/app/components/popups/WarningPopup";
+import {
+    hasAssistantTurn,
+    subscribeAssistantTurns,
+} from "@/app/lib/assistantTurns";
 import {
     LIQUID_GLASS_FLOAT_CLASS,
     LIQUID_GLASS_SELECTED_CLASS,
@@ -44,6 +50,7 @@ import {
 
 const NAV_ITEMS = [
     { href: "/assistant", label: "Assistant", icon: ChatSkeuoIcon },
+    { href: "/ide", label: "IDE", icon: IdeSkeuoIcon },
     { href: "/projects", label: "Projects", icon: FolderSkeuoIcon },
     { href: "/library", label: "Library", icon: LibrarySkeuoIcon },
     {
@@ -61,6 +68,24 @@ const recentProjectsCache = new Map<
     { projects: Project[]; hasMore: boolean }
 >();
 
+type AssistantHistoryStatus = "loading" | "complete";
+
+function withAssistantHistoryStatus(
+    current: Record<string, AssistantHistoryStatus>,
+    chatId: string,
+    status?: AssistantHistoryStatus,
+) {
+    if (status) {
+        return current[chatId] === status
+            ? current
+            : { ...current, [chatId]: status };
+    }
+    if (!(chatId in current)) return current;
+    const next = { ...current };
+    delete next[chatId];
+    return next;
+}
+
 function isNearScrollEnd(element: HTMLDivElement) {
     return (
         element.scrollHeight - element.scrollTop - element.clientHeight <= 32
@@ -77,6 +102,7 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
     const { profile } = useUserProfile();
     const { chats, loadingMoreChats, loadMoreChats, setCurrentChatId } =
         useChatHistoryContext();
+    const [signOutWarningOpen, setSignOutWarningOpen] = useState(false);
     const router = useRouter();
     const pathname = usePathname();
     const routeChatId = useMemo(() => {
@@ -89,6 +115,11 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
         );
         return projectChatMatch?.[1] ?? null;
     }, [pathname]);
+    const routeChatIdRef = useRef(routeChatId);
+    routeChatIdRef.current = routeChatId;
+    const [assistantHistoryStatuses, setAssistantHistoryStatuses] = useState<
+        Record<string, AssistantHistoryStatus>
+    >({});
     const [shouldAnimate, setShouldAnimate] = useState(false);
     const [isDropdownOpen, setIsDropdownOpen] = useState(false);
     const [projectsCollapsed, setProjectsCollapsed] = useState(false);
@@ -105,6 +136,51 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
         recentProjects ??
         (userId ? recentProjectsCache.get(userId)?.projects : undefined) ??
         null;
+
+    useEffect(
+        () =>
+            subscribeAssistantTurns((chatId, change, turn) => {
+                setAssistantHistoryStatuses((current) =>
+                    withAssistantHistoryStatus(
+                        current,
+                        chatId,
+                        change === "begin"
+                            ? "loading"
+                            : chatId === routeChatIdRef.current ||
+                                turn.assistant.error
+                              ? undefined
+                              : "complete",
+                    ),
+                );
+            }),
+        [],
+    );
+
+    useEffect(() => {
+        setAssistantHistoryStatuses((current) => {
+            let next = current;
+            if (routeChatId) {
+                next = withAssistantHistoryStatus(
+                    next,
+                    routeChatId,
+                    hasAssistantTurn(routeChatId) ? "loading" : undefined,
+                );
+            }
+            for (const chat of chats ?? []) {
+                if (
+                    chat.id !== routeChatId &&
+                    hasAssistantTurn(chat.id)
+                ) {
+                    next = withAssistantHistoryStatus(
+                        next,
+                        chat.id,
+                        "loading",
+                    );
+                }
+            }
+            return next;
+        });
+    }, [chats, routeChatId]);
 
     useEffect(() => {
         if (!userId) {
@@ -269,7 +345,7 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
             >
                 {/* Toggle + Logo */}
                 <div
-                    className={`items-center justify-between px-2 py-2 ${
+                    className={`h-12 shrink-0 items-center justify-between px-2 ${
                         !isOpen ? "hidden md:flex" : "flex"
                     }`}
                 >
@@ -291,7 +367,9 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
                         </div>
                     )}
                     <button
+                        type="button"
                         onClick={handleToggle}
+                        aria-label={isOpen ? "Close sidebar" : "Open sidebar"}
                         className={cn(
                             "flex h-8 w-8 shrink-0 items-center p-2 transition-colors",
                             "rounded-md",
@@ -527,7 +605,20 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
                                                         chat.project_name ??
                                                         undefined
                                                     }
+                                                    responseStatus={
+                                                        assistantHistoryStatuses[
+                                                            chat.id
+                                                        ]
+                                                    }
                                                     onSelect={() => {
+                                                        setAssistantHistoryStatuses(
+                                                            (current) =>
+                                                                withAssistantHistoryStatus(
+                                                                    current,
+                                                                    chat.id,
+                                                                    undefined,
+                                                                ),
+                                                        );
                                                         setCurrentChatId(
                                                             chat.id,
                                                         );
@@ -560,11 +651,12 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
                                 type="button"
                                 aria-expanded={isDropdownOpen}
                                 aria-controls="account-dropdown"
+                                aria-label="Account menu"
                                 onClick={() =>
                                     setIsDropdownOpen(!isDropdownOpen)
                                 }
                                 className={cn(
-                                    "flex w-full items-center rounded-xl px-2 py-3 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-blue-500/40 focus-visible:ring-offset-2",
+                                    "flex h-12 w-full shrink-0 items-center rounded-xl px-2 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-blue-500/40 focus-visible:ring-offset-2",
                                     !isOpen ? "hidden md:flex" : "",
                                     pathname.startsWith("/settings") ||
                                         pathname === "/history" ||
@@ -657,11 +749,9 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
                                             setIsDropdownOpen(false);
                                             void signOut()
                                                 .then(() => router.push("/"))
-                                                .catch(() => {
-                                                    window.alert(
-                                                        "Unable to sign out. Please try again.",
-                                                    );
-                                                });
+                                                .catch(() =>
+                                                    setSignOutWarningOpen(true),
+                                                );
                                         }}
                                         className={cn(
                                             "flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm text-gray-700",
@@ -677,6 +767,12 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
                     )}
                 </div>
             </div>
+            <WarningPopup
+                open={signOutWarningOpen}
+                title="Sign out failed"
+                message="Unable to sign out. Please try again."
+                onClose={() => setSignOutWarningOpen(false)}
+            />
         </>
     );
 }

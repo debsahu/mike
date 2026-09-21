@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
+import {
+    supabaseState,
+    resetSupabaseState,
+    mockSupabase,
+    makeQuery,
+} from "../helpers/supabaseMock";
 
 // ---------------------------------------------------------------------------
 // Hoisted mock fns we want to reconfigure per-test.
@@ -10,97 +16,27 @@ const { checkProjectAccess, deleteProjectsByIds } = vi.hoisted(() => ({
 }));
 
 // ---------------------------------------------------------------------------
-// Configurable Supabase stub. Each test seeds `supabaseState` in beforeEach;
-// terminal query operations (.single()/.maybeSingle()/thenable) resolve to the
-// per-table result, and rpc() resolves to a per-call result. Insert payloads
-// are recorded so tests can assert on normalisation (lowercasing / dedupe).
+// Supabase + auth stubs, shared with the other route suites via ../helpers/.
+// Every suite here mounts `app`, which loads every router, so they all need the
+// same fakes; see helpers/supabaseMock.ts for how `supabaseState` (seeded in
+// beforeEach below) drives the responses.
+//
+// `vi.mock` factories are hoisted above the imports, so they cannot close over
+// a top-level import binding — they pull the helper in dynamically instead. The
+// explicit ".js" is what TypeScript's node16 module resolution requires of a
+// dynamic (ECMAScript) import; Vite resolves it back to the .ts source, and
+// both specifiers resolve to the same module instance as the static import
+// above, so the state object the tests mutate is the one the stub reads.
 // ---------------------------------------------------------------------------
-type QueryResult = { data: unknown; error: unknown };
+vi.mock("../../lib/supabase", async () => {
+    const { mockSupabase } = await import("../helpers/supabaseMock.js");
+    return { createServerSupabase: vi.fn(() => mockSupabase()) };
+});
 
-let supabaseState: {
-    rpc: QueryResult;
-    tables: Record<string, QueryResult>;
-    inserts: { table: string; payload: unknown }[];
-};
-
-function resetSupabaseState() {
-    supabaseState = {
-        rpc: { data: [], error: null },
-        tables: {},
-        inserts: [],
-    };
-}
-resetSupabaseState();
-
-function resultForTable(table: string): QueryResult {
-    return supabaseState.tables[table] ?? { data: null, error: null };
-}
-
-function makeQuery(table: string) {
-    const q: Record<string, unknown> = {};
-    const chain = [
-    "select",
-    "update",
-    "delete",
-    "upsert",
-    "eq",
-    "neq",
-    "in",
-    "is",
-    "or",
-    "not",
-    "lt",
-    "gt",
-    "gte",
-    "lte",
-    "filter",
-    "order",
-    "limit",
-    "range",
-    "contains",
-    ];
-    for (const m of chain) q[m] = vi.fn(() => q);
-    q.insert = vi.fn((payload: unknown) => {
-        supabaseState.inserts.push({ table, payload });
-        return q;
-    });
-    q.single = vi.fn(() => Promise.resolve(resultForTable(table)));
-    q.maybeSingle = vi.fn(() => Promise.resolve(resultForTable(table)));
-  q.then = (
-    resolve: (v: unknown) => unknown,
-    reject?: (e: unknown) => unknown,
-  ) => Promise.resolve(resultForTable(table)).then(resolve, reject);
-    return q;
-}
-
-function mockSupabase() {
-    return {
-        from: vi.fn((table: string) => makeQuery(table)),
-        rpc: vi.fn(() => Promise.resolve(supabaseState.rpc)),
-        auth: {
-            getUser: () =>
-                Promise.resolve({ data: { user: { id: "u1" } }, error: null }),
-        },
-    };
-}
-
-vi.mock("../../lib/supabase", () => ({
-    createServerSupabase: vi.fn(() => mockSupabase()),
-}));
-
-vi.mock("../../middleware/auth", () => ({
-    requireAuth: (
-        _req: unknown,
-        res: { locals: Record<string, unknown> },
-        next: () => void,
-    ) => {
-        res.locals.userId = "u1";
-        res.locals.userEmail = "u1@test.local";
-        next();
-    },
-    requireMfaIfEnrolled: (_req: unknown, _res: unknown, next: () => void) =>
-        next(),
-}));
+vi.mock("../../middleware/auth", async () => {
+    const { authMock } = await import("../helpers/authMock.js");
+    return authMock();
+});
 
 // Every export of lib/access must be present — other routers (chat, documents,
 // downloads, tabular) import from it at app load.
@@ -116,7 +52,7 @@ vi.mock("../../lib/access", async (importOriginal) => ({
 }));
 
 // user router imports all four cleanup helpers at module load.
-vi.mock("../../lib/userDataCleanup", () => ({
+vi.mock("../../modules/user/user.dataCleanup", () => ({
     deleteProjectsByIds: (...args: unknown[]) => deleteProjectsByIds(...args),
     deleteAllUserChats: vi.fn(async () => {}),
     deleteAllUserTabularReviews: vi.fn(async () => {}),
@@ -135,7 +71,8 @@ vi.mock("../../lib/documentVersions", () => ({
 import { app } from "../../app";
 import crypto from "crypto";
 import { manifestPublicKey } from "../../lib/manifestSigning";
-import { createServerSupabase } from "../../lib/supabase";
+import { createServerSupabase, type Db } from "../../lib/supabase";
+import { attachActiveVersionPaths } from "../../lib/documentVersions";
 
 const SIGNING_KEY = "3b".repeat(32);
 
@@ -157,7 +94,7 @@ function captureRpcArgs(): { args: unknown; name: string | undefined } {
             captured.args = args;
             return originalRpc(name, args as never);
         });
-        return db as unknown as ReturnType<typeof createServerSupabase>;
+        return db as unknown as Db;
     });
     return captured;
 }
@@ -174,6 +111,101 @@ describe("projects.routes", () => {
             project: { id: "p1", user_id: "u1", org_id: null },
         });
         deleteProjectsByIds.mockResolvedValue(1);
+    });
+
+    describe("PATCH /projects/:projectId/documents/:documentId", () => {
+        it.each(["pdf", "docx", "xlsx", "pptx"])(
+            "preserves active %s version metadata after renaming",
+            async (fileType) => {
+                const version = {
+                    id: "v1",
+                    filename: `Original.${fileType}`,
+                    file_type: fileType,
+                    storage_path: `u1/doc-1/original.${fileType}`,
+                    pdf_storage_path: "u1/doc-1/preview.pdf",
+                    version_number: 3,
+                    size_bytes: 1024,
+                    page_count: 2,
+                    source: "upload",
+                };
+                supabaseState.tables.documents = {
+                    data: {
+                        id: "doc-1",
+                        project_id: "p1",
+                        current_version_id: "v1",
+                    },
+                    error: null,
+                };
+                supabaseState.tables.document_versions = {
+                    data: version,
+                    error: null,
+                };
+                vi.mocked(createServerSupabase).mockImplementationOnce(() => {
+                    const db = mockSupabase();
+                    db.from = vi.fn((table: string) => {
+                        const query = makeQuery(table);
+                        if (table === "document_versions") {
+                            query.update = vi.fn(
+                                (payload: Partial<typeof version>) => {
+                                    Object.assign(version, payload);
+                                    return query;
+                                },
+                            );
+                            query.then = (resolve: (value: unknown) => unknown) =>
+                                Promise.resolve({ data: [version], error: null }).then(
+                                    resolve,
+                                );
+                        }
+                        return query;
+                    });
+                    return db as unknown as ReturnType<typeof createServerSupabase>;
+                });
+                const actual = await vi.importActual<
+                    typeof import("../../lib/documentVersions")
+                >("../../lib/documentVersions");
+                vi.mocked(attachActiveVersionPaths).mockImplementationOnce(
+                    actual.attachActiveVersionPaths,
+                );
+
+                const res = await request(app)
+                    .patch("/projects/p1/documents/doc-1")
+                    .set(...AUTH)
+                    .send({ filename: "Renamed document" });
+
+                expect(res.status).toBe(200);
+                expect(res.body).toMatchObject({
+                    id: "doc-1",
+                    filename: `Renamed document.${fileType}`,
+                    file_type: fileType,
+                    storage_path: version.storage_path,
+                    pdf_storage_path: version.pdf_storage_path,
+                    active_version_number: 3,
+                    size_bytes: 1024,
+                    page_count: 2,
+                });
+                expect(version.filename).toBe(`Renamed document.${fileType}`);
+            },
+        );
+
+        it("does not report a successful rename when the version update fails", async () => {
+            supabaseState.tables.documents = {
+                data: { id: "doc-1", project_id: "p1", current_version_id: "v1" },
+                error: null,
+            };
+            supabaseState.tables.document_versions = {
+                data: { filename: "Original.pdf" },
+                error: { message: "private database failure" },
+            };
+
+            const res = await request(app)
+                .patch("/projects/p1/documents/doc-1")
+                .set(...AUTH)
+                .send({ filename: "Renamed.pdf" });
+
+            expect(res.status).toBe(500);
+            expect(JSON.stringify(res.body)).not.toContain("private database failure");
+            expect(attachActiveVersionPaths).not.toHaveBeenCalled();
+        });
     });
 
     // ── GET /projects (overview) ──────────────────────────────────────────
@@ -375,6 +407,150 @@ describe("projects.routes", () => {
 
       expect(res.status).toBe(404);
     });
+
+    // ── directory search vs. the deny override ─────────────────────────
+    // The picker's org branch used to be plain membership: `projects` where
+    // org_id IN (my orgs), with no per-project verdict. Every other path
+    // resolves through checkProjectAccess / project_access_role, which
+    // refuse on a deny — so the picker was handing a walled-off member the
+    // matter's name, cm_number and its document filenames.
+    //
+    // The shared stub answers per TABLE, and this route reads the same
+    // `projects` table three different ways, so these two tests use a
+    // filter-aware db instead.
+    function directorySearchDb(options: {
+      personal?: Record<string, unknown>[];
+      orgProjects?: Record<string, unknown>[];
+      memberships?: { org_id: string; role: string }[];
+      denies?: string[];
+    }) {
+      const personal = options.personal ?? [];
+      const orgProjects = options.orgProjects ?? [];
+      const memberships = options.memberships ?? [];
+      const denied = new Set(options.denies ?? []);
+
+      const build = (resolve: (f: Record<string, unknown>) => unknown[]) => {
+        const filters: Record<string, unknown> = {};
+        const b: Record<string, unknown> = {};
+        for (const method of ["select", "order", "limit", "range", "ilike"])
+          b[method] = () => b;
+        b.is = () => b;
+        b.eq = (column: string, value: unknown) => {
+          filters[`eq:${column}`] = value;
+          return b;
+        };
+        b.in = (column: string, value: unknown) => {
+          filters[`in:${column}`] = value;
+          return b;
+        };
+        b.single = () =>
+          Promise.resolve({ data: resolve(filters)[0] ?? null, error: null });
+        b.maybeSingle = b.single;
+        b.then = (onResolve: (v: unknown) => unknown) =>
+          Promise.resolve({ data: resolve(filters), error: null }).then(
+            onResolve,
+          );
+        return b;
+      };
+
+      return {
+        from: (table: string) => {
+          if (table === "projects")
+            return build((filters) => {
+              if (filters["in:org_id"]) return orgProjects;
+              if (filters["in:id"]) return [];
+              return personal;
+            });
+          if (table === "project_org_access_overrides")
+            // The deny read is scoped by the caller's memberships (org_id),
+            // their user_id and role — never by every org project's id.
+            return build((filters) => {
+              const orgIds = (filters["in:org_id"] as string[] | undefined) ?? [];
+              if (filters["in:project_id"]) return [];
+              return orgProjects
+                .filter(
+                  (project) =>
+                    denied.has(project.id as string) &&
+                    orgIds.includes(project.org_id as string),
+                )
+                .map((project) => ({ project_id: project.id }));
+            });
+          if (table === "org_members") return build(() => memberships);
+          return build(() => []);
+        },
+        rpc: () => Promise.resolve({ data: [], error: null }),
+        auth: {
+          getUser: () =>
+            Promise.resolve({ data: { user: { id: "u1" } }, error: null }),
+        },
+      };
+    }
+
+    const WALLED = {
+      id: "p-walled",
+      name: "Matter P",
+      cm_number: "2026-0042",
+      org_id: "o1",
+      user_id: "u2",
+      updated_at: "2026-09-01T00:00:00Z",
+    };
+
+    it("hides an org project the caller is denied on", async () => {
+      vi.mocked(createServerSupabase).mockImplementationOnce(
+        () =>
+          directorySearchDb({
+            memberships: [{ org_id: "o1", role: "member" }],
+            orgProjects: [WALLED],
+            denies: ["p-walled"],
+          }) as unknown as ReturnType<typeof createServerSupabase>,
+      );
+
+      const res = await request(app)
+        .get("/projects?view=directory-search&search=Matter")
+        .set(...AUTH);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([]);
+    });
+
+    it("still returns the org project when no deny override exists", async () => {
+      vi.mocked(createServerSupabase).mockImplementationOnce(
+        () =>
+          directorySearchDb({
+            memberships: [{ org_id: "o1", role: "member" }],
+            orgProjects: [WALLED],
+          }) as unknown as ReturnType<typeof createServerSupabase>,
+      );
+
+      const res = await request(app)
+        .get("/projects?view=directory-search&search=Matter")
+        .set(...AUTH);
+
+      expect(res.status).toBe(200);
+      expect(res.body.map((project: { id: string }) => project.id)).toEqual([
+        "p-walled",
+      ]);
+    });
+
+    it("keeps an org admin's view of a project carrying a stale deny row", async () => {
+      vi.mocked(createServerSupabase).mockImplementationOnce(
+        () =>
+          directorySearchDb({
+            memberships: [{ org_id: "o1", role: "admin" }],
+            orgProjects: [WALLED],
+            denies: ["p-walled"],
+          }) as unknown as ReturnType<typeof createServerSupabase>,
+      );
+
+      const res = await request(app)
+        .get("/projects?view=directory-search&search=Matter")
+        .set(...AUTH);
+
+      expect(res.status).toBe(200);
+      expect(res.body.map((project: { id: string }) => project.id)).toEqual([
+        "p-walled",
+      ]);
+    });
     });
 
     // ── GET /projects/ids (select-all-matching support) ──────────────────
@@ -390,7 +566,7 @@ describe("projects.routes", () => {
             vi.mocked(createServerSupabase).mockImplementationOnce(() => {
                 const db = mockSupabase();
                 db.rpc = rpcMock;
-                return db as unknown as ReturnType<typeof createServerSupabase>;
+                return db as unknown as Db;
             });
 
       const res = await request(app)
@@ -620,7 +796,12 @@ describe("projects.routes", () => {
           conflict_resolution: "rename",
         });
 
-      expect(res.status).toBe(404);
+      // 403, not 404: the viewer can see this project, so claiming it does
+      // not exist is a lie the UI then repeats to them.
+      expect(res.status).toBe(403);
+      expect(res.body.detail).toBe(
+        "You do not have permission to organize documents in this project.",
+      );
       expect(captured.name).toBeUndefined();
     });
 
@@ -1099,12 +1280,62 @@ describe("projects.routes", () => {
             expect(res.status).toBe(204);
         });
 
-        it("blocks a viewer (404)", async () => {
+        it("blocks a viewer with a refusal, not a fake 404", async () => {
             checkProjectAccess.mockResolvedValue(roleAccess("viewer"));
             const res = await request(app)
                 .delete("/projects/p1/folders/f1")
                 .set(...AUTH);
+            expect(res.status).toBe(403);
+            expect(res.body.detail).toBe(
+                "You do not have permission to organize documents in this project.",
+            );
+        });
+
+        it("still answers 404 when the project is invisible", async () => {
+            checkProjectAccess.mockResolvedValue({ ok: false });
+            const res = await request(app)
+                .delete("/projects/p1/folders/f1")
+                .set(...AUTH);
             expect(res.status).toBe(404);
+            expect(res.body.detail).toBe("Project not found");
+        });
+    });
+
+    // ── POST /projects/:projectId/folders (404 vs 403) ───────────────────
+    // "Project not found" for a viewer who is looking straight at the
+    // project is the bug: a refusal has to say it is a refusal.
+    describe("POST /projects/:projectId/folders", () => {
+        it("refuses a viewer with 403 and an intentional message", async () => {
+            checkProjectAccess.mockResolvedValue({
+                ok: true,
+                isCreator: false,
+                orgRole: "member",
+                projectRole: "viewer",
+                project: { id: "p1", user_id: "u2", org_id: "o1" },
+            });
+
+            const res = await request(app)
+                .post("/projects/p1/folders")
+                .set(...AUTH)
+                .send({ name: "Closing" });
+
+            expect(res.status).toBe(403);
+            expect(res.body.detail).toBe(
+                "You do not have permission to organize documents in this project.",
+            );
+            expect(supabaseState.inserts).toEqual([]);
+        });
+
+        it("keeps 404 for a project the caller cannot see at all", async () => {
+            checkProjectAccess.mockResolvedValue({ ok: false });
+
+            const res = await request(app)
+                .post("/projects/p1/folders")
+                .set(...AUTH)
+                .send({ name: "Closing" });
+
+            expect(res.status).toBe(404);
+            expect(res.body.detail).toBe("Project not found");
         });
     });
 

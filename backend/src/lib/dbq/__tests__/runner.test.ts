@@ -4,6 +4,7 @@ vi.mock("../../supabase", () => ({ createServerSupabase: vi.fn() }));
 vi.mock("../../storage", () => ({ deleteFile: vi.fn() }));
 
 import {
+    NonRetryableJobError,
     processClaimedJob,
     retryDelayMs,
     runDbJobTick,
@@ -173,6 +174,27 @@ describe("processClaimedJob fencing", () => {
         );
         expect(db.updates[0].payload.status).toBe("failed");
         expect(db.updates[0].filters).toEqual({ ...FENCE, attempts: 3 });
+    });
+
+    it("fails a NonRetryableJobError immediately, with attempts left", async () => {
+        // A job the domain REFUSES is not a job the network flaked on.
+        // Account deletion for the only admin of a live organization will be
+        // refused identically on every one of its 20 attempts; retrying it
+        // for hours buries the reason and leaves the user's request in limbo.
+        const db = makeDb();
+        await processClaimedJob(
+            db as never,
+            {
+                "test.kind": async () => {
+                    throw new NonRetryableJobError("refused by the domain");
+                },
+            },
+            JOB({ attempts: 1, max_attempts: 20 }),
+        );
+        expect(db.updates[0].payload.status).toBe("failed");
+        expect(db.updates[0].payload.last_error).toBe("refused by the domain");
+        expect(db.updates[0].payload.finished_at).toBeTruthy();
+        expect(db.updates[0].filters).toEqual(FENCE);
     });
 
     it("fences the unknown-kind write to this claim", async () => {
@@ -381,6 +403,50 @@ describe("runDbJobRetentionSweep", () => {
         const failedPurge = db.deletes.find(
             (d) => d.status === "failed" && "lt:finished_at" in d,
         );
-        expect(failedPurge?.["neq:kind"]).toBe("storage.cleanup");
+        expect(failedPurge?.["neq:kind"]).toEqual(["storage.cleanup", "document.cleanup"]);
+    });
+});
+
+describe("explicit failure hooks", () => {
+    it("forwards failure hooks through batch dispatch only after recording terminal failure", async () => {
+        const job = JOB({ attempts: 3 });
+        const db = makeDb({ rpc: async () => ({ data: [job], error: null }) });
+        const hook = vi.fn(async (seenDb, seenJob) => {
+            expect(seenDb).toBe(db);
+            expect(seenJob).toBe(job);
+            expect(db.updates[0].payload.status).toBe("failed");
+        });
+        await runDbJobTick(db as never, { "test.kind": async () => { throw new Error("terminal"); } }, { "test.kind": hook });
+        expect(hook).toHaveBeenCalledOnce();
+    });
+    it("does not call terminal hooks for retryable or deferred work", async () => {
+        const db = makeDb();
+        const hook = vi.fn();
+        for (const error of [new Error("transient"), new DbJobDeferredError(new Date(Date.now() + 5000).toISOString(), "wait")]) {
+            await processClaimedJob(db as never, { "test.kind": async () => { throw error; } }, JOB(), { "test.kind": hook });
+        }
+        expect(hook).not.toHaveBeenCalled();
+        expect(db.updates.every(row => row.payload.status === "pending")).toBe(true);
+    });
+    it("contains a hook failure without abandoning later batch jobs", async () => {
+        const db = makeDb({ rpc: async () => ({ data: [JOB({ attempts: 3 }), JOB({ id: "next", kind: "success" })], error: null }) });
+        const hook = vi.fn(async () => { throw new Error("hook unavailable"); });
+        await runDbJobTick(db as never, { "test.kind": async () => { throw new Error("terminal"); }, success: async () => {} }, { "test.kind": hook });
+        expect(hook).toHaveBeenCalledOnce();
+        expect(db.updates.find(row => row.id === "next")?.payload.status).toBe("done");
+    });
+
+    // memory_consolidation_results rows exist only so a retried
+    // memory.consolidate job applies each scope once. Nothing else deletes
+    // them, so without this step the table grew without bound for the life of
+    // the deployment.
+    it("prunes curator receipts once their job row is old enough to sweep", async () => {
+        const db = makeDb();
+        await runDbJobRetentionSweep(db as never);
+        const receiptPurge = db.deletes.find(
+            (d) => d.table === "memory_consolidation_results",
+        );
+        expect(receiptPurge).toBeDefined();
+        expect(receiptPurge?.["lt:created_at"]).toEqual(expect.any(String));
     });
 });

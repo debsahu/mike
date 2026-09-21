@@ -6,6 +6,7 @@
     "moduleResolution": "bundler",
     "types": ["node", "office-js", "office-runtime", "react", "react-dom"],
     "paths": {
+      "@mike/contracts": ["../packages/contracts/index.d.ts"],
       "react": [
         "./node_modules/@types/react/index.d.ts"
       ],
@@ -50,6 +51,12 @@
       ],
       "@mike/pill-button-ui": [
         "../frontend/src/shared/ui/PillButtonUI.tsx"
+      ],
+      "@mike/tab-pill-button-ui": [
+        "../frontend/src/shared/ui/TabPillButtonUI.tsx"
+      ],
+      "@mike/toggle-switch-ui": [
+        "../frontend/src/shared/ui/ToggleSwitchUI.tsx"
       ],
       "@mike/dropdown-ui": [
         "../frontend/src/shared/ui/DropdownUI.tsx"

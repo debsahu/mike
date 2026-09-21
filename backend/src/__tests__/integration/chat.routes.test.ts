@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
+import { streamAiSdk } from "../../lib/llm/aiSdk";
+import {
+    callStep,
+    config,
+    makeModel,
+    textStep,
+    tick,
+} from "../../lib/llm/__tests__/mockLanguageModel";
+import type { AssistantEvent } from "@mike/contracts";
 
 // #383's model-selection describes grew this file past the chat limiter's
 // 30-requests-per-window budget, so the last describe began answering 429
@@ -44,12 +53,47 @@ const {
         terminalUpdateAttempts: 0,
         terminalUpdateGate: null as Promise<void> | null,
         wordChatMissing: false,
+        // Makes the chat_access_grants probe behind hasDirectContentGrants
+        // fail, which is how a transient DB error reaches the route.
+        failContentGrantLookup: false,
         // When set, selects on chat_messages resolve against these rows with
         // the eq/not/order/limit chain genuinely applied (a mini query
         // engine), so tests can prove which assistant row a query picks.
         assistantMessageRows: null as Record<string, unknown>[] | null,
     },
 }));
+
+const { streamWithProvider, unexpectedFetch } = vi.hoisted(() => ({
+    streamWithProvider: vi.fn(),
+    unexpectedFetch: vi.fn(() => {
+        throw new Error("Unexpected network request in chat route tests");
+    }),
+}));
+
+vi.mock("../../modules/chat/chat.title", () => ({
+    generateAssistantChatTitle: vi.fn(async () => "Generated Title"),
+}));
+
+vi.mock("../../lib/llm/providers", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../../lib/llm/providers")>()),
+    streamWithProvider: (...args: unknown[]) => streamWithProvider(...args),
+}));
+
+vi.mock("../../lib/mcpConnectors", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../../lib/mcpConnectors")>()),
+    buildUserMcpTools: vi.fn(async () => []),
+}));
+
+beforeEach(() => {
+    unexpectedFetch.mockClear();
+    streamWithProvider.mockReset();
+    vi.stubGlobal("fetch", unexpectedFetch);
+});
+
+afterEach(() => {
+    vi.unstubAllGlobals();
+    expect(unexpectedFetch).not.toHaveBeenCalled();
+});
 
 // A permissive, chainable Supabase stub. Every query-builder method returns the
 // same object (so arbitrary chains work), the object is awaitable (thenable),
@@ -135,6 +179,16 @@ function makeQuery(table: string) {
                 data: null,
                 error: { message: "assistant reservation failed" },
             };
+        } else if (
+            table === "chat_messages" &&
+            dbControl.assistantMessageRows
+        ) {
+            dbControl.assistantMessageRows.push({
+                ...(value as Record<string, unknown>),
+                created_at: String(
+                    dbControl.assistantMessageRows.length,
+                ).padStart(4, "0"),
+            });
         }
         return q;
     });
@@ -174,6 +228,15 @@ function makeQuery(table: string) {
     reject?: (e: unknown) => unknown,
     ) => {
         const resolveQuery = async () => {
+            if (
+                dbControl.failContentGrantLookup &&
+                table === "chat_access_grants"
+            ) {
+                return {
+                    data: null,
+                    error: { message: "grants relation unavailable" },
+                };
+            }
             if (activeUpdate?.table === "chat_messages") {
                 dbControl.terminalUpdateAttempts += 1;
                 if (dbControl.terminalUpdateGate) {
@@ -188,6 +251,20 @@ function makeQuery(table: string) {
                             message: `terminal update failed (attempt ${dbControl.terminalUpdateAttempts})`,
                         },
                     };
+                }
+            }
+            if (
+                activeUpdate?.table === "chat_messages" &&
+                dbControl.assistantMessageRows
+            ) {
+                for (const row of dbControl.assistantMessageRows) {
+                    if (
+                        activeUpdate.filters.every(
+                            (f) => row[f.column] === f.value,
+                        )
+                    ) {
+                        Object.assign(row, activeUpdate.value);
+                    }
                 }
             }
             if (
@@ -229,6 +306,21 @@ function mockSupabase() {
     from: vi.fn((table: string) => makeQuery(table)),
     rpc: vi.fn((name: string, args: unknown) => {
       dbRpcCalls.push({ name, args });
+      // Model the append-only persistence seam for the wired pause/resume
+      // tests. The RPC implementation itself is not exercised here.
+      const params = args as Record<string, unknown>;
+      const row = dbControl.assistantMessageRows?.find(
+        (item) => item.id === params.p_message_id &&
+          item.chat_id === params.p_chat_id &&
+          item.author_user_id === params.p_author_user_id,
+      );
+      if (row && Array.isArray(row.content)) {
+        if (name === "append_chat_ask_inputs_response") {
+          row.content = [...row.content, params.p_response];
+        } else if (name === "append_chat_assistant_events") {
+          row.content = [...row.content, ...(params.p_events as unknown[])];
+        }
+      }
       return Promise.resolve({
         data: name.startsWith("append_chat_") ? "appended" : null,
         error: null,
@@ -274,8 +366,8 @@ vi.mock("../../middleware/auth", () => ({
 // Keep the real error helpers (the failure-path test relies on genuine
 // isAbortError + AssistantStreamError behavior) but stub the functions that
 // would otherwise hit the DB or the LLM.
-vi.mock("../../lib/chat", async (importOriginal) => {
-    const actual = await importOriginal<typeof import("../../lib/chat")>();
+vi.mock("../../modules/chat/engine/index", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../../modules/chat/engine/index")>();
     return {
         ...actual,
         buildDocContext: vi.fn(async () => ({
@@ -289,7 +381,7 @@ vi.mock("../../lib/chat", async (importOriginal) => {
     };
 });
 
-vi.mock("../../lib/userSettings", () => ({
+vi.mock("../../modules/user/user.settings", () => ({
     getUserModelSettings: vi.fn(async () => ({
         legal_research_us: false,
         title_model: "test-model",
@@ -344,6 +436,7 @@ function findAssistantUpdate() {
 describe("POST /chat — streaming endpoint", () => {
     beforeEach(() => {
     vi.clearAllMocks();
+    runLLMStream.mockReset();
     dbInserts.length = 0;
     dbUpdates.length = 0;
     dbRpcCalls.length = 0;
@@ -353,6 +446,7 @@ describe("POST /chat — streaming endpoint", () => {
         dbControl.terminalUpdateAttempts = 0;
         dbControl.terminalUpdateGate = null;
         dbControl.wordChatMissing = false;
+        dbControl.failContentGrantLookup = false;
         dbControl.assistantMessageRows = null;
         runLLMStream.mockResolvedValue({
             fullText: "hi there",
@@ -362,7 +456,7 @@ describe("POST /chat — streaming endpoint", () => {
     });
 
     it("streams SSE with a chat_id event on the happy path", async () => {
-        const chatLib = await import("../../lib/chat");
+        const chatLib = await import("../../modules/chat/engine/index.js");
         let reservationExistedBeforeStreaming = false;
         runLLMStream.mockImplementation(async () => {
             reservationExistedBeforeStreaming = !!findAssistantReservation();
@@ -481,23 +575,48 @@ describe("POST /chat — streaming endpoint", () => {
     errorSpy.mockRestore();
   });
 
-  it("fails closed before streaming when memory activity cannot be fenced", async () => {
-    beginMemoryConversationTurn.mockRejectedValueOnce(
-      new Error("Memory activity could not be fenced"),
-    );
+  it("answers a sanitized 500 when the shared-audience probe fails", async () => {
+    // hasDirectContentGrants throws on a database error and the memory
+    // eligibility block awaited it outside any try/catch. On Express 5 (this
+    // repo) the rejection reaches handleUnhandledError, so the request is
+    // answered either way; the route-level catch keeps the failure
+    // attributable to this call site. Either way the contract below must
+    // hold: a sanitized 500, no stream started, no internals leaked.
+    dbControl.failContentGrantLookup = true;
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await request(app)
+      .post("/chat")
+      .set("Authorization", "Bearer test")
+      .send({ ...VALID_BODY, chat_id: "chat-1" });
+
+    expect(res.status).toBe(500);
+    expect(res.body.detail).toBe("Something went wrong. Please try again.");
+    // The internal message never reaches the client.
+    expect(JSON.stringify(res.body)).not.toContain("grants relation");
+    expect(runLLMStream).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("still answers, without curating the turn, when memory activity cannot be fenced", async () => {
+    // The lease is optional bookkeeping. beginMemoryConversationTurn fails
+    // open (returns null) and the route must stream as normal; the only
+    // consequence is that this turn is not scheduled as a learning
+    // checkpoint and there is no lease to release afterwards.
+    beginMemoryConversationTurn.mockResolvedValueOnce(null);
 
     const res = await request(app)
       .post("/chat")
       .set("Authorization", "Bearer test")
       .send(VALID_BODY);
 
-    expect(res.status).toBe(500);
-    expect(res.body.detail).toBe("Something went wrong. Please try again.");
-    expect(runLLMStream).not.toHaveBeenCalled();
-    expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
-    errorSpy.mockRestore();
-    });
+    expect(res.status).toBe(200);
+    expect(runLLMStream).toHaveBeenCalledTimes(1);
+    expect(scheduleMemoryConsolidation).toHaveBeenCalledWith(
+      expect.objectContaining({ turn: null }),
+    );
+    expect(releaseMemoryConversationTurn).not.toHaveBeenCalled();
+  });
 
     it("rejects a chat without an explicit model before streaming", async () => {
         const res = await request(app)
@@ -514,10 +633,12 @@ describe("POST /chat — streaming endpoint", () => {
     });
 
     it("uses the profile last-selected model when a new chat omits model", async () => {
-        const userSettings = await import("../../lib/userSettings");
+        const userSettings = await import("../../modules/user/user.settings.js");
         vi.mocked(userSettings.getUserModelSettings).mockResolvedValueOnce({
             legal_research_us: false,
             title_model: null,
+            memory_curator_model: null,
+            last_selected_reasoning_level: null,
             tabular_model: null,
             last_selected_chat_model: "gpt-5.6-luna",
             api_keys: { openai: "test-key" },
@@ -561,6 +682,71 @@ describe("POST /chat — streaming endpoint", () => {
         expect(res.text).toContain("[DONE]");
     });
 
+    it("forwards a rejected API key as a fixable error, not a retry prompt", async () => {
+        // "Please try again" sends the user to retry something that cannot
+        // succeed until they change the key, so the engine's verdict that this
+        // failure is safe to show has to survive onto the wire.
+        const { AssistantStreamError } = await import(
+            "../../modules/chat/engine/index.js"
+        );
+        const message =
+            "Your Anthropic (Claude) API key was rejected. Check the key in Settings \u2192 Bring Your Own Keys and try again.";
+        runLLMStream.mockImplementation(async () => {
+            throw new AssistantStreamError(message, "", [
+                {
+                    type: "error",
+                    message,
+                    safe_to_display: true,
+                    code: "invalid_api_key",
+                },
+            ]);
+        });
+
+        const res = await request(app)
+            .post("/chat")
+            .set("Authorization", "Bearer test")
+            .send(VALID_BODY);
+
+        expect(res.status).toBe(200);
+        expect(res.text).toContain('"type":"error"');
+        expect(res.text).toContain("was rejected");
+        expect(res.text).toContain('"safe_to_display":true');
+        expect(res.text).toContain('"code":"invalid_api_key"');
+        expect(res.text).not.toContain("could not be completed");
+        expect(res.text).toContain("[DONE]");
+    });
+
+    it("keeps an unexplained failure generic and uncoded", async () => {
+        // Only errors the engine marked safe may reach the user; anything else
+        // still collapses to the generic message with no actionable code.
+        const { AssistantStreamError } = await import(
+            "../../modules/chat/engine/index.js"
+        );
+        runLLMStream.mockImplementation(async () => {
+            throw new AssistantStreamError(
+                "The response could not be completed. Please try again.",
+                "",
+                [
+                    {
+                        type: "error",
+                        message:
+                            "The response could not be completed. Please try again.",
+                    },
+                ],
+            );
+        });
+
+        const res = await request(app)
+            .post("/chat")
+            .set("Authorization", "Bearer test")
+            .send(VALID_BODY);
+
+        expect(res.status).toBe(200);
+        expect(res.text).toContain("could not be completed");
+        expect(res.text).not.toContain('"code"');
+        expect(res.text).not.toContain('"safe_to_display":true');
+    });
+
     it("persists an ask-input pause without reporting an empty response", async () => {
         const askInputsEvent = {
             type: "ask_inputs" as const,
@@ -599,9 +785,275 @@ describe("POST /chat — streaming endpoint", () => {
         });
         expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
     });
+    it.each<AssistantEvent>([
+        {
+            type: "doc_created",
+            filename: "Draft.docx",
+            download_url: "/docx/draft",
+        },
+        {
+            type: "doc_download",
+            filename: "Draft.docx",
+            download_url: "/docx/draft",
+        },
+        {
+            type: "doc_edited",
+            filename: "Draft.docx",
+            document_id: "document-1",
+            version_id: "version-2",
+            version_number: 2,
+            download_url: "/docx/draft",
+            annotations: [],
+        },
+        {
+            type: "doc_replicated",
+            filename: "Template.docx",
+            count: 1,
+            copies: [
+                {
+                    new_filename: "Draft.docx",
+                    document_id: "document-1",
+                    version_id: "version-1",
+                },
+            ],
+        },
+        {
+            type: "workflow_applied",
+            workflow_id: "workflow-1",
+            title: "Draft a letter",
+        },
+        {
+            type: "error",
+            message: "Document generation failed.",
+            safe_to_display: true,
+        },
+        {
+            type: "mcp_tool_call",
+            connector_id: "connector-1",
+            connector_name: "Search",
+            tool_name: "search",
+            openai_tool_name: "mcp_search",
+            status: "error",
+            error: "Search service unavailable.",
+        },
+    ])(
+        "persists a $type-only turn without an empty-response error",
+        async (event) => {
+            runLLMStream.mockResolvedValue({
+                fullText: "",
+                events: [event],
+                citations: [],
+            });
+
+            const res = await request(app)
+                .post("/chat")
+                .set("Authorization", "Bearer test")
+                .send(VALID_BODY);
+
+            expect(res.status).toBe(200);
+            expect(res.text).not.toContain("empty response");
+            expect(findAssistantUpdate()?.value).toMatchObject({
+                content: [event],
+            });
+            expect(res.text.match(/data: \[DONE\]/g)).toHaveLength(1);
+        },
+    );
+
+    it.each<AssistantEvent[]>([
+        [{ type: "reasoning", text: "Considering the request" }],
+        [{ type: "content", text: "   " }],
+        [{ type: "doc_read", filename: "Agreement.docx" }],
+        [{
+            type: "mcp_tool_call",
+            connector_id: "connector-1",
+            connector_name: "Search",
+            tool_name: "search",
+            openai_tool_name: "mcp_search",
+            status: "ok",
+        }],
+        [
+            {
+                type: "doc_find",
+                filename: "Agreement.docx",
+                query: "notice",
+                total_matches: 1,
+            },
+        ],
+    ])(
+        "still reports an empty response for intermediate activity %#",
+        async (...events) => {
+            runLLMStream.mockResolvedValue({
+                fullText: " ",
+                events,
+                citations: [],
+            });
+
+            const res = await request(app)
+                .post("/chat")
+                .set("Authorization", "Bearer test")
+                .send(VALID_BODY);
+
+            expect(res.text).toContain("empty response");
+            expect(res.text.match(/data: \[DONE\]/g)).toHaveLength(1);
+            expect(findAssistantUpdate()).toBeUndefined();
+        },
+    );
+
+    it.each([false, true])(
+        "persists and resumes a real SDK clarification pause (malformed first call: %s)",
+        async (malformedFirstCall) => {
+            const realChat =
+                await vi.importActual<typeof import("../../modules/chat/engine/index.js")>(
+                    "../../modules/chat/engine/index.js",
+                );
+            const mockedChat = await import("../../modules/chat/engine/index.js");
+            const question = {
+                id: "jurisdiction",
+                kind: "text",
+                question: "Which jurisdiction?",
+            };
+            const model = await makeModel([
+                ...(malformedFirstCall
+                    ? [callStep("bad-1", "ask_inputs", '{"items":')]
+                    : []),
+                callStep("ask-1", "ask_inputs", { items: [question] }),
+                textStep("must not run after a clarification pause"),
+            ]);
+            streamWithProvider.mockImplementationOnce((params) =>
+                streamAiSdk(params, config(model)),
+            );
+            runLLMStream.mockImplementationOnce(realChat.runLLMStream);
+            vi.mocked(mockedChat.buildMessages).mockImplementationOnce(
+                realChat.buildMessages,
+            );
+            vi.mocked(mockedChat.enrichWithPriorEvents).mockImplementationOnce(
+                realChat.enrichWithPriorEvents,
+            );
+            dbControl.assistantMessageRows = [];
+            await seedResolvableModel();
+
+            const first = await request(app)
+                .post("/chat")
+                .set("Authorization", "Bearer test")
+                .send({ ...VALID_BODY, model: "gpt-5.6-terra" });
+
+            expect(first.text).toContain('"type":"ask_inputs"');
+            expect(first.text).not.toContain('"type":"error"');
+            expect(first.text.match(/data: \[DONE\]/g)).toHaveLength(1);
+            expect(findAssistantUpdate()?.value).toMatchObject({
+                content: expect.arrayContaining([
+                    expect.objectContaining({ type: "ask_inputs", items: [question] }),
+                ]),
+            });
+            await tick();
+            expect(model.doStreamCalls).toHaveLength(
+                malformedFirstCall ? 2 : 1,
+            );
+            if (malformedFirstCall) {
+                expect(
+                    JSON.stringify(model.doStreamCalls[1]?.prompt),
+                ).toContain("bad-1");
+                expect(
+                    JSON.stringify(model.doStreamCalls[1]?.prompt),
+                ).toContain("error");
+            }
+
+            const loaded = await request(app)
+                .get("/chat/chat-1")
+                .set("Authorization", "Bearer test");
+            expect(loaded.status).toBe(200);
+            expect(loaded.body.messages).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({
+                        role: "assistant",
+                        content: expect.arrayContaining([
+                            expect.objectContaining({ type: "ask_inputs", items: [question] }),
+                        ]),
+                    }),
+                ]),
+            );
+
+            const pausedMessage = loaded.body.messages.find(
+                (message: { role: string }) => message.role === "assistant",
+            );
+            const askEvent = pausedMessage.content.find(
+                (event: { type: string }) => event.type === "ask_inputs",
+            );
+            expect(askEvent.event_id).toEqual(expect.any(String));
+            const resumed = await makeModel([textStep("I will use New York law.")]);
+            streamWithProvider.mockImplementationOnce((params) =>
+                streamAiSdk(params, config(resumed)),
+            );
+            runLLMStream.mockImplementationOnce(realChat.runLLMStream);
+            vi.mocked(mockedChat.buildMessages).mockImplementationOnce(
+                realChat.buildMessages,
+            );
+            vi.mocked(mockedChat.enrichWithPriorEvents).mockImplementationOnce(
+                realChat.enrichWithPriorEvents,
+            );
+            await seedResolvableModel();
+            const second = await request(app)
+                .post("/chat")
+                .set("Authorization", "Bearer test")
+                .send({
+                    model: "gpt-5.6-terra",
+                    chat_id: "chat-1",
+                    messages: [
+                        { role: "user", content: "Draft a letter." },
+                        { role: "assistant", content: "" },
+                        { role: "user", content: "New York" },
+                    ],
+                    ask_inputs_response: {
+                        assistant_message_id: pausedMessage.id,
+                        ask_event_id: askEvent.event_id,
+                        responses: [{ ...question, answer: "New York" }],
+                    },
+                });
+
+            expect(second.text).not.toContain('"type":"error"');
+            expect(dbRpcCalls).toContainEqual({
+                name: "append_chat_ask_inputs_response",
+                args: expect.objectContaining({
+                    p_chat_id: "chat-1",
+                    p_message_id: pausedMessage.id,
+                    p_ask_event_id: askEvent.event_id,
+                    p_author_user_id: "u1",
+                    p_response: expect.objectContaining({
+                        assistant_message_id: pausedMessage.id,
+                        ask_event_id: askEvent.event_id,
+                    }),
+                }),
+            });
+            const deltas = second.text
+                .split("\n\n")
+                .filter((line) => line.startsWith("data: {"))
+                .map((line) => JSON.parse(line.slice(6)))
+                .filter((event) => event.type === "content_delta");
+            expect(deltas.map((event) => event.text).join("")).toBe(
+                "I will use New York law.",
+            );
+            expect(second.text.match(/data: \[DONE\]/g)).toHaveLength(1);
+            expect(JSON.stringify(resumed.doStreamCalls[0]?.prompt)).toContain(
+                "user answered:",
+            );
+            expect(JSON.stringify(resumed.doStreamCalls[0]?.prompt)).toContain(
+                "New York",
+            );
+            const saved = dbControl.assistantMessageRows.filter(
+                (row) => row.role === "assistant",
+            );
+            expect(saved).toHaveLength(1);
+            expect(saved[0].content).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({ type: "ask_inputs_response" }),
+                    { type: "content", text: "I will use New York law." },
+                ]),
+            );
+        },
+    );
 
     it("stores cloud Word chats only in the document-scoped Word tables", async () => {
-        const chatLib = await import("../../lib/chat");
+        const chatLib = await import("../../modules/chat/engine/index.js");
         const res = await request(app)
             .post("/word-chat")
             .set("Authorization", "Bearer test")
@@ -741,10 +1193,12 @@ describe("POST /chat — streaming endpoint", () => {
     });
 
     it("uses the shared last-selected model for a local Word chat", async () => {
-        const userSettings = await import("../../lib/userSettings");
+        const userSettings = await import("../../modules/user/user.settings.js");
         vi.mocked(userSettings.getUserModelSettings).mockResolvedValueOnce({
             legal_research_us: false,
             title_model: null,
+            memory_curator_model: null,
+            last_selected_reasoning_level: null,
             tabular_model: null,
             last_selected_chat_model: "gpt-5.6-luna",
             api_keys: { openai: "test-key" },
@@ -953,7 +1407,7 @@ describe("POST /chat — streaming endpoint", () => {
                 .split("\n")
                 .find((line) => line.includes('"type":"chat_id"'))!
                 .replace(/^data:\s*/, ""),
-        ) as { assistantMessageId: string };
+        ) as { chatId: string; assistantMessageId: string };
         const assistantInsert = findAssistantReservation();
         const assistantUpdate = findAssistantUpdate();
         expect(assistantInsert?.value).toMatchObject({
@@ -982,7 +1436,7 @@ describe("POST /chat — streaming endpoint", () => {
     });
 
     it("uses the streamed assistant message id when persisting a cancelled partial response", async () => {
-        const { AssistantStreamAbortError } = await import("../../lib/chat");
+        const { AssistantStreamAbortError } = await import("../../modules/chat/engine/index.js");
         runLLMStream.mockRejectedValue(
             new AssistantStreamAbortError("partial", [
                 { type: "content", text: "partial" },
@@ -1000,7 +1454,7 @@ describe("POST /chat — streaming endpoint", () => {
                 .split("\n")
                 .find((line) => line.includes('"type":"chat_id"'))!
                 .replace(/^data:\s*/, ""),
-        ) as { assistantMessageId: string };
+        ) as { chatId: string; assistantMessageId: string };
         const assistantInsert = findAssistantReservation();
         const assistantUpdate = findAssistantUpdate();
         expect(assistantInsert?.value).toMatchObject({
@@ -1248,7 +1702,7 @@ describe("POST /chat — streaming endpoint", () => {
     });
 
     it("makes document_context tool-readable without adding it to the system prompt", async () => {
-        const chatLib = await import("../../lib/chat");
+        const chatLib = await import("../../modules/chat/engine/index.js");
         const res = await request(app)
             .post("/word-chat")
             .set("Authorization", "Bearer test")
@@ -1283,10 +1737,12 @@ describe("POST /chat — streaming endpoint", () => {
     });
 
     it("keeps CourtListener disabled for Word chats even when legal research is enabled", async () => {
-        const chatLib = await import("../../lib/chat");
-        const userSettings = await import("../../lib/userSettings");
+        const chatLib = await import("../../modules/chat/engine/index.js");
+        const userSettings = await import("../../modules/user/user.settings.js");
         vi.mocked(userSettings.getUserModelSettings).mockResolvedValueOnce({
             title_model: "test-model",
+            memory_curator_model: null,
+            last_selected_reasoning_level: null,
             tabular_model: "test-model",
             last_selected_chat_model: null,
             legal_research_us: true,
@@ -1336,7 +1792,7 @@ describe("PATCH /chat/:chatId", () => {
     });
 
     it("updates the chat and profile when a model is selected", async () => {
-        const userSettings = await import("../../lib/userSettings");
+        const userSettings = await import("../../modules/user/user.settings.js");
         const res = await request(app)
             .patch("/chat/chat-1")
             .set("Authorization", "Bearer test")
@@ -1356,7 +1812,7 @@ describe("PATCH /chat/:chatId", () => {
     });
 
     it("updates the chat and profile when reasoning is selected", async () => {
-        const userSettings = await import("../../lib/userSettings");
+        const userSettings = await import("../../modules/user/user.settings.js");
         const res = await request(app)
             .patch("/chat/chat-1")
             .set("Authorization", "Bearer test")
@@ -1384,7 +1840,7 @@ describe("PATCH /word-chat/:chatId/model", () => {
     });
 
     it("updates a cloud Word chat and the profile on selection", async () => {
-        const userSettings = await import("../../lib/userSettings");
+        const userSettings = await import("../../modules/user/user.settings.js");
         const chatId = "6f783e59-35c4-4ddc-896a-94aa4d05a768";
         const documentId = "6f783e59-35c4-4ddc-896a-94aa4d05a767";
         const res = await request(app)
@@ -1653,10 +2109,12 @@ function makeRbacDb(
 // one, which would fail these permission tests with a 429 that has
 // nothing to do with permissions. Seed a resolvable selection per test.
 async function seedResolvableModel() {
-    const userSettings = await import("../../lib/userSettings");
+    const userSettings = await import("../../modules/user/user.settings.js");
     vi.mocked(userSettings.getUserModelSettings).mockResolvedValueOnce({
         legal_research_us: false,
         title_model: null,
+        memory_curator_model: null,
+        last_selected_reasoning_level: null,
         tabular_model: null,
         last_selected_chat_model: "gpt-5.6-luna",
         api_keys: { openai: "test-key" },
@@ -1719,6 +2177,48 @@ describe("chat writes are gated on content.edit (org RBAC)", () => {
         expect(res.body).toHaveProperty("detail");
     });
 
+    // A Viewer can open the project, so answering "Project not found" told
+    // them their matter had vanished. The refusal has to say it is one.
+    it("403s a project Viewer creating a chat in that project", async () => {
+        mockedCreate.mockImplementation(
+            () =>
+                makeRbacDb(null, "colleague-1", {
+                    grantRole: "viewer",
+                    project: { org_id: null },
+                    chat: { org_id: null },
+                }) as never,
+        );
+
+        const res = await request(app)
+            .post("/chat/create")
+            .set("Authorization", "Bearer test")
+            .send({ project_id: "proj-1" });
+
+        expect(res.status).toBe(403);
+        expect(res.body.detail).toBe(
+            "You do not have permission to write in this project.",
+        );
+    });
+
+    it("keeps 404 when the project is invisible to the caller", async () => {
+        mockedCreate.mockImplementation(
+            () =>
+                makeRbacDb(null, "colleague-1", {
+                    grantRole: null,
+                    project: { org_id: null },
+                    chat: { org_id: null },
+                }) as never,
+        );
+
+        const res = await request(app)
+            .post("/chat/create")
+            .set("Authorization", "Bearer test")
+            .send({ project_id: "proj-1" });
+
+        expect(res.status).toBe(404);
+        expect(res.body.detail).toBe("Project not found");
+    });
+
     it("does not elevate a project chat's creator above project access", async () => {
         mockedCreate.mockImplementation(() => makeRbacDb(null, "u1") as never);
 
@@ -1754,6 +2254,27 @@ describe("chat writes are gated on content.edit (org RBAC)", () => {
 
         expect(res.status).toBe(200);
         expect(res.body.title).toBe("Generated Title");
+    });
+
+    // The update's error used to be ignored, so a failed write still
+    // answered 200 with the new title: the sidebar renamed the chat and the
+    // next reload silently put the old name back.
+    it("reports a failed title write instead of answering 200", async () => {
+        await seedResolvableModel();
+        mockedCreate.mockImplementation(
+            () =>
+                makeRbacDb("admin", "colleague-1", {
+                    chatWriteError: "title update failed",
+                }) as never,
+        );
+
+        const res = await request(app)
+            .post("/chat/chat-1/generate-title")
+            .set("Authorization", "Bearer test")
+            .send({ message: "hello there" });
+
+        expect(res.status).toBe(500);
+        expect(res.body.detail).toBe("Something went wrong. Please try again.");
     });
 
     it("still lets a project viewer GET the chat (reads stay project.view)", async () => {
@@ -1947,6 +2468,84 @@ describe("chat grants, deletion and roster", () => {
         });
     });
 
+    // The route needs exactly one fact about the creator: their email address,
+    // so a grant is never handed to the person who already owns the chat. It
+    // used to get that by reading EVERY user_profiles row in the deployment
+    // into two maps and then looking up a single entry. On a firm-sized
+    // deployment that is the whole address book crossing the wire on every
+    // share click, and it is the only profile read in the file that carries
+    // no predicate at all — which is what makes it visible to this test.
+    it("reads the creator's profile row by id instead of scanning every profile", async () => {
+        const profileQueries: {
+            eq: { mock: { calls: unknown[][] } };
+            in: { mock: { calls: unknown[][] } };
+        }[] = [];
+        mockedCreate.mockImplementation(() => {
+            const db = makeRbacDb(null, "u1", {
+                chat: { project_id: null, org_id: null },
+                profiles: [
+                    {
+                        user_id: "u1",
+                        email: "u1@test.local",
+                        display_name: "Current user",
+                    },
+                    {
+                        user_id: "mate",
+                        email: "mate@example.com",
+                        display_name: "Mate",
+                    },
+                ],
+                chatGrants: [
+                    {
+                        id: "cg-mate",
+                        chat_id: "chat-1",
+                        email: "mate@example.com",
+                        role: "viewer",
+                        created_by: "u1",
+                        created_at: "2026-09-02T00:00:00Z",
+                        updated_at: "2026-09-02T00:00:00Z",
+                    },
+                ],
+            });
+            const originalFrom = db.from;
+            db.from = vi.fn((table: string) => {
+                const query = originalFrom(table);
+                if (table === "user_profiles")
+                    profileQueries.push(
+                        query as unknown as (typeof profileQueries)[number],
+                    );
+                return query;
+            }) as never;
+            return db as never;
+        });
+
+        const res = await request(app)
+            .post("/chat/chat-1/access")
+            .set("Authorization", "Bearer test")
+            .send({ email: "mate@example.com", role: "viewer" });
+
+        // The grant still lands: this is about HOW the creator was resolved,
+        // not about refusing the request.
+        expect(res.status).toBe(201);
+
+        const narrowedBy = profileQueries.map((query) => [
+            ...query.eq.mock.calls.map((call) => call[0] as string),
+            ...query.in.mock.calls.map((call) => call[0] as string),
+        ]);
+        expect(narrowedBy.length).toBeGreaterThan(0);
+        // No read of the profile table may go out without a predicate.
+        expect(
+            narrowedBy.filter((columns) => columns.length === 0),
+            "a user_profiles read went out with no eq/in predicate: that is a full-table scan",
+        ).toEqual([]);
+        // And the creator is fetched by the id the chat already carries,
+        // rather than by reading everyone and filtering in Node.
+        expect(
+            narrowedBy.some((columns) => columns.includes("user_id")),
+            "the creator's profile was never read by user_id",
+        ).toBe(true);
+    });
+
     it("400s when a direct grant targets an unknown user", async () => {
         mockedCreate.mockImplementation(
             () =>
@@ -1971,6 +2570,158 @@ describe("chat grants, deletion and roster", () => {
         expect(res.body.detail).toBe(
             "future@example.com does not belong to a Mike user.",
         );
+    });
+
+    // The creator's email now comes from one filtered row instead of a scan
+    // of every profile in the deployment; this pins that the row it reads is
+    // still the right one, since the "creator already has access" refusal is
+    // the only thing that email decides.
+    it("400s when a grant targets the chat creator's own email", async () => {
+        mockedCreate.mockImplementation(
+            () =>
+                makeRbacDb(null, "colleague-1", {
+                    chat: { project_id: null, org_id: null },
+                    chatGrantRole: "owner",
+                    profiles: [
+                        {
+                            user_id: "decoy",
+                            email: "decoy@example.com",
+                            display_name: "Decoy",
+                        },
+                        {
+                            user_id: "colleague-1",
+                            email: "colleague@example.com",
+                            display_name: "Creator",
+                        },
+                    ],
+                }) as never,
+        );
+
+        const res = await request(app)
+            .post("/chat/chat-1/access")
+            .set("Authorization", "Bearer test")
+            .send({ email: "Colleague@Example.com", role: "viewer" });
+
+        expect(res.status).toBe(400);
+        expect(res.body.detail).toBe(
+            "The chat creator already has owner access",
+        );
+    });
+
+    it("500s when the creator's profile read fails, without writing a grant", async () => {
+        // A FAILED READ IS NOT "the creator has no email". Swallowing the
+        // error sent `creatorEmail: null` into upsertContentGrant — and that
+        // email is the only thing standing between the creator and a guest
+        // grant on their own chat. So a transient database fault quietly
+        // created exactly the row the check exists to prevent.
+        const grantWrites: string[] = [];
+        mockedCreate.mockImplementation(() => {
+            const db = makeRbacDb(null, "colleague-1", {
+                chat: { project_id: null, org_id: null },
+                chatGrantRole: "owner",
+                profiles: [
+                    {
+                        user_id: "colleague-1",
+                        email: "colleague@example.com",
+                        display_name: "Creator",
+                    },
+                ],
+            });
+            const originalFrom = db.from;
+            db.from = vi.fn((table: string) => {
+                if (table === "user_profiles") {
+                    // ONLY the creator lookup fails — it is the read keyed by
+                    // `user_id`. Every other profile read (the one that
+                    // resolves the RECIPIENT's account) still works, so the
+                    // request cannot fall into a 500 for some other reason.
+                    const profiles = [
+                        {
+                            user_id: "colleague-1",
+                            email: "colleague@example.com",
+                            display_name: "Creator",
+                        },
+                        {
+                            user_id: "mate",
+                            email: "mate@example.com",
+                            display_name: "Mate",
+                        },
+                    ];
+                    const filters: Record<string, unknown> = {};
+                    const q: Record<string, unknown> = {};
+                    for (const method of ["select", "is", "order", "limit"])
+                        q[method] = () => q;
+                    q.eq = (column: string, value: unknown) => {
+                        filters[column] = value;
+                        return q;
+                    };
+                    q.in = (column: string, values: unknown[]) => {
+                        filters[column] = values;
+                        return q;
+                    };
+                    const settle = () =>
+                        "user_id" in filters
+                            ? {
+                                  data: null,
+                                  error: { message: "connection reset" },
+                              }
+                            : {
+                                  data: profiles.filter((row) =>
+                                      Object.entries(filters).every(
+                                          ([column, value]) =>
+                                              Array.isArray(value)
+                                                  ? value.includes(
+                                                        row[
+                                                            column as keyof typeof row
+                                                        ],
+                                                    )
+                                                  : row[
+                                                        column as keyof typeof row
+                                                    ] === value,
+                                      ),
+                                  ),
+                                  error: null,
+                              };
+                    q.maybeSingle = () => {
+                        const { data, error } = settle();
+                        return Promise.resolve({
+                            data: data?.[0] ?? null,
+                            error,
+                        });
+                    };
+                    q.single = q.maybeSingle;
+                    q.then = (resolve: (v: unknown) => unknown) =>
+                        Promise.resolve(settle()).then(resolve);
+                    return q;
+                }
+                const query = originalFrom(table) as Record<string, unknown>;
+                if (table === "chat_access_grants")
+                    for (const method of ["upsert", "insert"] as const) {
+                        const original = query[method] as (
+                            ...args: unknown[]
+                        ) => unknown;
+                        query[method] = (...args: unknown[]) => {
+                            grantWrites.push(method);
+                            return original(...args);
+                        };
+                    }
+                return query;
+            }) as never;
+            return db as never;
+        });
+
+        const res = await request(app)
+            .post("/chat/chat-1/access")
+            .set("Authorization", "Bearer test")
+            .send({ email: "mate@example.com", role: "viewer" });
+
+        expect.soft(res.status).toBe(500);
+        expect.soft(res.body.detail).toBe(
+            "Something went wrong. Please try again.",
+        );
+        // The internal message never reaches the client...
+        expect.soft(JSON.stringify(res.body)).not.toContain("connection reset");
+        // ...and nothing was written.
+        expect.soft(grantWrites).toEqual([]);
     });
 
     it("403s a directly granted member trying to manage grants", async () => {

@@ -25,6 +25,12 @@ export interface OfficeSeed {
   staleInsertedRangeOriginals?: string[];
   unselectableOriginals?: string[];
   /**
+   * Reject the next sync that carries a tracked edit. "before-apply" rolls
+   * the mock document back first; "after-apply" keeps the revisions while
+   * simulating a lost/failed response from Word.
+   */
+  trackedMutationSyncFailure?: "before-apply" | "after-apply";
+  /**
    * Structured description of the document body for the markdown document
    * context: when present, body.paragraphs/body.tables exist and describe
    * these blocks; when absent (every pre-existing spec), those collections
@@ -166,6 +172,7 @@ export function installOfficeMock(seed: OfficeSeed): void {
     sessionStorage.setItem(documentStateKey, JSON.stringify(documentState));
   };
   if (!sessionStorage.getItem(documentStateKey)) persistDocumentState();
+  let trackedMutationSyncFailure = seed.trackedMutationSyncFailure;
 
   const markParagraphDeleted = (paragraphIndex: number): void => {
     const deleted = documentState.deletedParagraphIndexes ?? [];
@@ -242,8 +249,7 @@ export function installOfficeMock(seed: OfficeSeed): void {
           key.startsWith(chatStorageModePrefix) &&
           (savedValue === "cloud" || savedValue === "local")
         ) {
-          storedOfficeValues[key] =
-            savedValue === "local" ? "local" : "cloud";
+          storedOfficeValues[key] = savedValue === "local" ? "local" : "cloud";
         }
       }
     } catch {
@@ -283,8 +289,7 @@ export function installOfficeMock(seed: OfficeSeed): void {
           key === editApplyModeKey &&
           (value === "approval" || value === "direct")
         ) {
-          storedOfficeValues[key] =
-            value === "direct" ? "direct" : "approval";
+          storedOfficeValues[key] = value === "direct" ? "direct" : "approval";
           persistOfficeValues();
         } else if (
           key.startsWith(chatStorageModePrefix) &&
@@ -367,7 +372,7 @@ export function installOfficeMock(seed: OfficeSeed): void {
     displayDialogAsync: (
       url: string,
       options: Record<string, unknown>,
-      callback: (result: any) => void
+      callback: (result: any) => void,
     ) => {
       oauthDialog.url = url;
       oauthDialog.options = clone(options);
@@ -506,9 +511,23 @@ export function installOfficeMock(seed: OfficeSeed): void {
   };
 
   function makeContext(): any {
+    let mutationSyncPending = false;
+    let documentStateBeforeMutation: StoredDocumentState | null = null;
+    let trackedCallsBeforeMutation = 0;
     const context: any = {
       document: null,
-      sync: () => Promise.resolve(),
+      sync: async () => {
+        if (!mutationSyncPending || !trackedMutationSyncFailure) return;
+        const failureMode = trackedMutationSyncFailure;
+        trackedMutationSyncFailure = undefined;
+        mutationSyncPending = false;
+        if (failureMode === "before-apply" && documentStateBeforeMutation) {
+          documentState = clone(documentStateBeforeMutation);
+          wordCalls.trackedChanges.length = trackedCallsBeforeMutation;
+          persistDocumentState();
+        }
+        throw new Error("GeneralException: tracked mutation sync failed");
+      },
     };
     const doc: any = {
       changeTrackingMode: ChangeTrackingMode.off,
@@ -523,6 +542,11 @@ export function installOfficeMock(seed: OfficeSeed): void {
       const entry: WordCall = { text, location };
       if (original !== undefined) entry.original = original;
       if (doc.changeTrackingMode === ChangeTrackingMode.trackAll) {
+        if (trackedMutationSyncFailure && !mutationSyncPending) {
+          documentStateBeforeMutation = clone(documentState);
+          trackedCallsBeforeMutation = wordCalls.trackedChanges.length;
+          mutationSyncPending = true;
+        }
         wordCalls.trackedChanges.push(entry);
       } else {
         wordCalls.inserts.push(entry);
@@ -772,7 +796,7 @@ export function installOfficeMock(seed: OfficeSeed): void {
     // revision covering the passage, mirroring real Word.
     const createFormattedRevisionGroup = (
       entry: WordCall,
-      text: string
+      text: string,
     ): string[] => {
       documentState.groupSequence++;
       const groupId = `revision-group-${documentState.groupSequence}`;
@@ -806,7 +830,7 @@ export function installOfficeMock(seed: OfficeSeed): void {
         makeTrackedChangeCollection(
           Object.values(documentState.revisions)
             .filter((revision) => revision.resolution === null)
-            .map((revision) => makeStoredTrackedChange(revision.id))
+            .map((revision) => makeStoredTrackedChange(revision.id)),
         ),
       search: (query: string, options?: any) => {
         wordCalls.searches++;

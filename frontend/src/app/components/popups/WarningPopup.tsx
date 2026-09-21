@@ -1,10 +1,10 @@
 "use client";
 
 import { createPortal } from "react-dom";
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { AlertCircle, X } from "lucide-react";
-import { GlassIconButton } from "@/app/components/ui/glass-icon-button";
-import { PillButton } from "@/app/components/ui/pill-button";
+import { GlassIconButtonUI } from "@/shared/ui/GlassIconButtonUI";
+import { PillButtonUI } from "@/shared/ui/PillButtonUI";
 import { cn } from "@/app/lib/utils";
 import { LIQUID_GLASS_FLOAT_CLASS } from "@/shared/ui/LiquidGlassUI";
 
@@ -35,6 +35,15 @@ export function WarningPopup({
     primaryAction,
     className,
 }: WarningPopupProps) {
+    useEffect(() => {
+        if (!open) return;
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === "Escape") onClose();
+        };
+        document.addEventListener("keydown", handleKeyDown);
+        return () => document.removeEventListener("keydown", handleKeyDown);
+    }, [onClose, open]);
+
     if (!open) return null;
 
     const warningIcon = icon ?? (
@@ -44,6 +53,9 @@ export function WarningPopup({
     return createPortal(
         <div className="pointer-events-none fixed left-1/2 top-5 z-[220] w-[min(92vw,520px)] -translate-x-1/2 px-4">
             <div
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
                 className={cn(
                     `pointer-events-auto relative flex rounded-2xl px-3 py-3 text-xs ${LIQUID_GLASS_FLOAT_CLASS} backdrop-blur-2xl`,
                     className,
@@ -72,24 +84,24 @@ export function WarningPopup({
                     {children}
                     {primaryAction && (
                         <div className="mt-2 flex items-center justify-end">
-                            <PillButton
+                            <PillButtonUI
                                 tone="black"
                                 size="sm"
                                 onClick={primaryAction.onClick}
                                 disabled={primaryAction.disabled}
                             >
                                 {primaryAction.label}
-                            </PillButton>
+                            </PillButtonUI>
                         </div>
                     )}
                 </div>
-                <GlassIconButton
+                <GlassIconButtonUI
                     onClick={onClose}
                     className="absolute right-1.5 top-1.5 h-5 w-5"
                     aria-label="Dismiss warning"
                 >
                     <X className="h-3 w-3" />
-                </GlassIconButton>
+                </GlassIconButtonUI>
             </div>
         </div>,
         document.body,

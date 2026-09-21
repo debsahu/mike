@@ -22,7 +22,10 @@
     "test:e2e": "playwright test",
     "test:e2e:webkit": "playwright test --project=webkit",
     "test:e2e:headed": "playwright test --headed",
-    "test:e2e:ui": "playwright test --ui"
+    "test:e2e:ui": "playwright test --ui",
+    "live:login": "node e2e-live/word-web-session.mjs --login",
+    "live:word": "node e2e-live/manual-session.mjs",
+    "live:stub": "node e2e-live/anthropic-stub.mjs"
   },
   "dependencies": {
     "@radix-ui/react-dropdown-menu": "^2.1.24",
@@ -32,7 +35,7 @@
     "@tiptap/react": "3.31.3",
     "@tiptap/starter-kit": "3.31.3",
     "clsx": "^2.1.1",
-    "lucide-react": "^1.41.0",
+    "lucide-react": "^1.45.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",
@@ -43,16 +46,16 @@
   "devDependencies": {
     "@playwright/test": "^1.63.0",
     "@tailwindcss/postcss": "^4.1.18",
-    "@types/node": "^26.4.1",
-    "@types/office-js": "^1.0.608",
+    "@types/node": "^26.5.1",
+    "@types/office-js": "^1.0.609",
     "@types/office-runtime": "^1.0.40",
-    "@types/react": "^19.2.0",
-    "@types/react-dom": "^19.2.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "css-loader": "^7.1.5",
     "html-webpack-plugin": "^5.6.8",
     "http-server": "^14.1.1",
-    "office-addin-debugging": "^6.1.2",
-    "office-addin-dev-certs": "^2.0.9",
+    "office-addin-debugging": "^7.0.0",
+    "office-addin-dev-certs": "^3.0.0",
     "postcss": "^8.5.28",
     "postcss-loader": "^8.2.0",
     "semver": "^7.8.5",
@@ -67,6 +70,8 @@
   },
   "overrides": {
     "@xmldom/xmldom": "^0.9.12",
-    "js-yaml": "^4.3.2"
+    "adm-zip": "^0.6.1",
+    "js-yaml": "^4.3.2",
+    "qs": "^6.15.4"
   }
 }
