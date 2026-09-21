@@ -7,10 +7,6 @@ const store = createDynamicModelStore<OllamaModelOption>(() =>
     getOllamaModels(),
 );
 
-export function refreshOllamaModels(): Promise<OllamaModelOption[]> {
-    return store.refresh();
-}
-
 export function useOllamaModels(): OllamaModelOption[] {
     return store.useModels();
 }

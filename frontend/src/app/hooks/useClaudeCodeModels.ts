@@ -9,10 +9,6 @@ const store = createDynamicModelStore<ClaudeCodeModelOption>(() =>
     getClaudeCodeModels(),
 );
 
-export function refreshClaudeCodeModels(): Promise<ClaudeCodeModelOption[]> {
-    return store.refresh();
-}
-
 export function useClaudeCodeModels(): ClaudeCodeModelOption[] {
     return store.useModels();
 }

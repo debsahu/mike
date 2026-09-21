@@ -104,7 +104,11 @@ missing or was not loaded, so recreate the backend container after you edit
   web) disabled, no settings, hooks, plugins or `CLAUDE.md` files, and an empty
   working directory. It can use only Mike's tools.
 - **Minimal environment:** the subprocess gets a small allowlist of environment
-  variables. Mike's database, storage and provider secrets are not passed to it.
+  variables. `CLAUDE_CODE_OAUTH_TOKEN` is forwarded, since it is what
+  authenticates the subscription. Mike's own secrets stay out: database,
+  storage, and the API keys for the other providers. An inherited
+  `ANTHROPIC_API_KEY` is dropped in particular, because Claude Code would bill
+  it instead of the subscription.
 - **History:** earlier chat turns are replayed to Claude as a text transcript,
   the same text-only history the other providers receive.
 

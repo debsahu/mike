@@ -1,21 +1,17 @@
 import { useEffect, useState } from "react";
 
-// Module-level store so every picker shares one fetch and a refresh propagates
-// to all of them. Resolves to an empty list when the source is unreachable or
-// disabled; the app works without runtime-discovered models.
+// Module-level store so every picker shares one fetch and one cache. Resolves
+// to an empty list when the source is unreachable or disabled; the app works
+// without runtime-discovered models. The catalog is fixed for the life of the
+// page, so there is no invalidation: a picker that must see new models reloads.
 export function createDynamicModelStore<T>(fetchModels: () => Promise<T[]>): {
-    refresh: () => Promise<T[]>;
     useModels: () => T[];
 } {
     let cache: T[] | null = null;
     let inflight: Promise<T[]> | null = null;
     const listeners = new Set<() => void>();
 
-    function load(force = false): Promise<T[]> {
-        if (force) {
-            cache = null;
-            inflight = null;
-        }
+    function load(): Promise<T[]> {
         if (cache) return Promise.resolve(cache);
         if (!inflight) {
             inflight = fetchModels()
@@ -30,11 +26,6 @@ export function createDynamicModelStore<T>(fetchModels: () => Promise<T[]>): {
                 });
         }
         return inflight;
-    }
-
-    // Clear the cache and refetch; mounted pickers update automatically.
-    function refresh(): Promise<T[]> {
-        return load(true);
     }
 
     function useModels(): T[] {
@@ -52,5 +43,5 @@ export function createDynamicModelStore<T>(fetchModels: () => Promise<T[]>): {
         return models;
     }
 
-    return { refresh, useModels };
+    return { useModels };
 }
